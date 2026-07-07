@@ -75,6 +75,15 @@ made to TelemetryForge.
   CPU cost during normal rendering.
 - Limited boot animation playback to Windows autostart; manual and Remote
   Deck rendering starts skip the boot sequence.
+
+### Low-memory tray startup
+
+- Changed Windows autostart to run headless in the tray without creating the
+  WebView2 editor window.
+- Recreated the editor window lazily only when **Open TelemetryForge** is
+  selected from the tray menu.
+- Destroyed the editor WebView when the window is closed, keeping the renderer
+  and tray process alive while releasing WebView2 memory.
 - Added a **Share** action that exports the current `.telemetryforge` package
   and a PNG preview side by side.
 - Added an editable bundled **TelemetryForge Boot** sample screen.

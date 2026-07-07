@@ -12,14 +12,41 @@ mod ui;
 mod windows_startup;
 
 use app_state::AppState;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager,
+    AppHandle, Manager, WebviewUrl, WebviewWindowBuilder,
 };
+
+static EXIT_REQUESTED_FROM_TRAY: AtomicBool = AtomicBool::new(false);
+
+fn create_main_window(app: &AppHandle) -> tauri::Result<()> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.show()?;
+        window.set_focus()?;
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+        .title("TelemetryForge")
+        .inner_size(1120.0, 760.0)
+        .min_inner_size(900.0, 650.0)
+        .resizable(true)
+        .build()?;
+    Ok(())
+}
+
+fn create_main_window_async(app: AppHandle) {
+    std::thread::spawn(move || {
+        if let Err(error) = create_main_window(&app) {
+            tracing::error!(%error, "could not create TelemetryForge window");
+        }
+    });
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let start_minimized = std::env::args().any(|arg| arg == "--minimized");
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_log::Builder::new().build())
@@ -60,10 +87,12 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                if let Err(error) = window.destroy() {
+                    tracing::error!(%error, "could not destroy hidden editor window");
+                }
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
             let remote_state = app.state::<AppState>().inner().clone();
             tauri::async_runtime::spawn(remote_server::manage(remote_state));
             let show = MenuItem::with_id(app, "show", "Open TelemetryForge", true, None::<&str>)?;
@@ -75,28 +104,34 @@ pub fn run() {
             }
             tray.on_menu_event(|app, event| match event.id.as_ref() {
                 "show" => {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
+                    create_main_window_async(app.clone());
                 }
-                "quit" => app.exit(0),
+                "quit" => {
+                    EXIT_REQUESTED_FROM_TRAY.store(true, Ordering::Relaxed);
+                    app.exit(0);
+                }
                 _ => {}
             })
             .build(app)?;
 
-            if std::env::args().any(|arg| arg == "--minimized") {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
-                }
+            if start_minimized {
                 if let Err(error) =
                     ui::start_rendering_from_windows_startup(app.state::<AppState>())
                 {
                     tracing::error!(%error, "could not start rendering during Windows startup");
                 }
+            } else {
+                create_main_window(app.handle())?;
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run TelemetryForge");
+        .build(tauri::generate_context!())
+        .expect("failed to build TelemetryForge")
+        .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if !EXIT_REQUESTED_FROM_TRAY.load(Ordering::Relaxed) {
+                    api.prevent_exit();
+                }
+            }
+        });
 }

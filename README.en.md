@@ -61,7 +61,9 @@ This includes `config.yaml`, saved screens and bundled samples. Legacy data
 found next to the executable is migrated automatically. Windows autostart
 loads the last active configuration and starts rendering in the system tray.
 It uses an immediate Task Scheduler logon trigger instead of the delayed
-`HKCU\Run` startup queue.
+`HKCU\Run` startup queue. In autostart mode, TelemetryForge does not create
+the WebView2 editor window until you open it from the tray, reducing idle tray
+memory usage.
 
 ## Release build
 
