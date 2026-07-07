@@ -36,6 +36,7 @@ pub struct SensorSnapshot {
     pub weather_code: Option<u16>,
     pub weather_condition: Option<String>,
     pub fan_sensors: Vec<NamedSensor>,
+    pub disk_sensors: Vec<NamedSensor>,
     pub history_cpu: Vec<f32>,
     pub history_gpu: Vec<f32>,
     pub history_gpu_power: Vec<f32>,

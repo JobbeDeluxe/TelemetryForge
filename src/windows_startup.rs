@@ -33,7 +33,7 @@ $ErrorActionPreference = 'Stop'
 $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $action = New-ScheduledTaskAction -Execute $env:TELEMETRYFORGE_EXE -Argument '--minimized' -WorkingDirectory $env:TELEMETRYFORGE_DIR
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 4
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -Priority 0
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName $env:TELEMETRYFORGE_TASK -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description 'Start TelemetryForge immediately when the user signs in.' -Force | Out-Null
 "#;

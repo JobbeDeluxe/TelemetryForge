@@ -18,6 +18,7 @@ let gifPreviewBusy = false;
 let availableScreens = [];
 let availableSuperWidgets = [];
 let availableFanSensors = [];
+let availableDiskSensors = [];
 let undoStack = [], redoStack = [];
 
 function showWorkspacePage(page) {
@@ -209,7 +210,9 @@ async function boot() {
   $("autostart").checked = autostartEnabled;
   await Promise.all([loadPorts(), loadScreens()]);
   await loadSuperWidgets();
-  await loadFanSensors();
+  const sensorSnapshot = await invoke("test_sensors").catch(() => null);
+  await loadFanSensors(sensorSnapshot);
+  await loadDiskSensors(sensorSnapshot);
   await refreshPreview();
   await refreshStatus();
   setInterval(refreshStatus, 1200);
@@ -248,6 +251,7 @@ function bindConfig() {
     cpuTemperatureSource: config.cpu_temperature_source || "core",
     cpuClockSource: config.cpu_clock_source || "average",
     fanSensor: config.fan_sensor || "",
+    diskSource: config.disk_source || "",
     weatherEnabled: config.weather?.enabled ?? false,
     weatherLatitude: config.weather?.latitude ?? 51.5074,
     weatherLongitude: config.weather?.longitude ?? -0.1278,
@@ -404,6 +408,15 @@ async function loadFanSensors(snapshot) {
   $("fanSensor").innerHTML = `<option value="">${t("automatic")}</option>` +
     sensors.map(sensor => `<option value="${esc(sensor.id)}">${esc(sensor.name)} — ${Math.round(sensor.value)} RPM</option>`).join("");
   $("fanSensor").value = config.fan_sensor || "";
+}
+
+async function loadDiskSensors(snapshot) {
+  snapshot ||= await invoke("test_sensors").catch(() => null);
+  const sensors = snapshot?.disk_sensors || [];
+  availableDiskSensors = sensors;
+  $("diskSource").innerHTML = `<option value="">${t("automatic")}</option>` +
+    sensors.map(sensor => `<option value="${esc(sensor.id)}">${esc(sensor.name)} — ${Math.round(sensor.value)}%</option>`).join("");
+  $("diskSource").value = config.disk_source || "";
 }
 
 function selectLayer(index, additive = false) {
@@ -1062,6 +1075,7 @@ function readForm() {
   config.cpu_temperature_source = $("cpuTemperatureSource").value;
   config.cpu_clock_source = $("cpuClockSource").value;
   config.fan_sensor = $("fanSensor").value || null;
+  config.disk_source = $("diskSource").value || null;
   config.weather ||= {};
   config.weather.enabled = $("weatherEnabled").checked;
   config.weather.latitude = Math.max(-90, Math.min(90, +$("weatherLatitude").value || 0));
@@ -1292,7 +1306,7 @@ document.querySelectorAll("[data-quick-load]").forEach(button => button.onclick=
 });
 $("render-toggle").onclick=toggleRendering;
 $("test-display").onclick=async()=>{try{await save();$("status").textContent=await invoke("test_display");}catch(e){$("error").textContent=`${t("testFailed")}: ${e}`;}};
-$("test-sensors").onclick=async()=>{try{const s=await invoke("test_sensors");await loadFanSensors(s);$("error").textContent="";$("status").textContent=`CPU ${fmt(s.cpu_temperature)}°C / ${fmt(s.cpu_clock)} MHz · GPU ${fmt(s.gpu_temperature)}°C / ${fmt(s.gpu_usage)}% / ${fmt(s.gpu_clock)} MHz / ${fmt(s.gpu_power)} W · RAM ${fmt(s.ram_usage)}% · VOL ${fmt(s.system_volume)}% · ${t("diskLabel")} ${fmt(s.disk_usage)}% · ${t("networkLabel")} ↓${fmt(s.network_download)} ↑${fmt(s.network_upload)} KB/s`;}catch(e){$("error").textContent=`${t("sensorTestFailed")}: ${e}`;}};
+$("test-sensors").onclick=async()=>{try{const s=await invoke("test_sensors");await loadFanSensors(s);await loadDiskSensors(s);$("error").textContent="";$("status").textContent=`CPU ${fmt(s.cpu_temperature)}°C / ${fmt(s.cpu_clock)} MHz · GPU ${fmt(s.gpu_temperature)}°C / ${fmt(s.gpu_usage)}% / ${fmt(s.gpu_clock)} MHz / ${fmt(s.gpu_power)} W · RAM ${fmt(s.ram_usage)}% · VOL ${fmt(s.system_volume)}% · ${t("diskLabel")} ${fmt(s.disk_usage)}% · ${t("networkLabel")} ↓${fmt(s.network_download)} ↑${fmt(s.network_upload)} KB/s`;}catch(e){$("error").textContent=`${t("sensorTestFailed")}: ${e}`;}};
 $("send-once").onclick=async()=>{try{await save();await invoke("render_once");}catch(e){$("error").textContent=`${t("sendFailed")}: ${e}`;}};
 window.addEventListener("resize",renderOverlay);
 window.addEventListener("keydown", event => {

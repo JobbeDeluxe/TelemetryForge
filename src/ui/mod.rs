@@ -30,6 +30,7 @@ fn merge_screen_settings(mut screen: AppConfig, current: &AppConfig) -> AppConfi
     screen.cpu_temperature_source = current.cpu_temperature_source;
     screen.cpu_clock_source = current.cpu_clock_source;
     screen.fan_sensor = current.fan_sensor.clone();
+    screen.disk_source = current.disk_source.clone();
     screen.weather = current.weather.clone();
     screen.remote = current.remote.clone();
     screen.quick_screens = current.quick_screens.clone();
@@ -240,6 +241,7 @@ pub fn new_screen(state: State<AppState>, name: String) -> Result<AppConfig, Str
     config.libre_hardware_monitor_dll = current.libre_hardware_monitor_dll;
     config.cpu_clock_source = current.cpu_clock_source;
     config.fan_sensor = current.fan_sensor;
+    config.disk_source = current.disk_source;
     config.weather = current.weather;
     config.remote = current.remote;
     config.quick_screens = current.quick_screens;
@@ -396,6 +398,7 @@ pub fn test_sensors(state: State<AppState>) -> crate::sensors::model::SensorSnap
         config.cpu_temperature_source,
         config.cpu_clock_source,
         config.fan_sensor.as_deref(),
+        config.disk_source.as_deref(),
         &config.weather,
     );
     *state.sensors.write() = snapshot.clone();
@@ -464,6 +467,7 @@ pub fn render_once(state: State<AppState>) -> Result<(), String> {
         config.cpu_temperature_source,
         config.cpu_clock_source,
         config.fan_sensor.as_deref(),
+        config.disk_source.as_deref(),
         &config.weather,
     );
     let image = renderer::render(&config, &snapshot).map_err(|e| e.to_string())?;
@@ -548,6 +552,7 @@ fn start_rendering_with_boot(state: &AppState, allow_boot_animation: bool) -> Re
                 initial.cpu_temperature_source,
                 initial.cpu_clock_source,
                 initial.fan_sensor.as_deref(),
+                initial.disk_source.as_deref(),
                 &initial.weather,
             );
             let mut displayed = target.clone();
@@ -587,6 +592,7 @@ fn start_rendering_with_boot(state: &AppState, allow_boot_animation: bool) -> Re
                         current.cpu_temperature_source,
                         current.cpu_clock_source,
                         current.fan_sensor.as_deref(),
+                        current.disk_source.as_deref(),
                         &current.weather,
                     );
                     update_histories(&mut next, &target, 120);
@@ -898,6 +904,7 @@ fn update_displayed_snapshot(
         changed = true;
     }
     current.fan_sensors.clone_from(&target.fan_sensors);
+    current.disk_sensors.clone_from(&target.disk_sensors);
     changed
 }
 

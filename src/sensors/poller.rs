@@ -1,5 +1,7 @@
 use super::{
-    libre_hardware_monitor::Reader as HardwareReader, model::SensorSnapshot, weather,
+    libre_hardware_monitor::Reader as HardwareReader,
+    model::{NamedSensor, SensorSnapshot},
+    weather,
     windows_volume::Reader as VolumeReader,
 };
 use crate::config::schema::{CpuClockSource, CpuTemperatureSource, WeatherConfig};
@@ -7,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
+use sysinfo::{CpuRefreshKind, Disk, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
 
 pub struct SensorPoller {
     system: System,
@@ -61,6 +63,7 @@ impl SensorPoller {
         cpu_temperature_source: CpuTemperatureSource,
         cpu_clock_source: CpuClockSource,
         fan_sensor: Option<&str>,
+        disk_source: Option<&str>,
         weather_config: &WeatherConfig,
     ) -> SensorSnapshot {
         self.system.refresh_cpu_usage();
@@ -70,16 +73,8 @@ impl SensorPoller {
         let network_interval = self.last_network_refresh.elapsed().as_secs_f32().max(0.001);
         self.last_network_refresh = Instant::now();
 
-        let disk_usage = self
-            .disks
-            .list()
-            .iter()
-            .filter(|disk| disk.total_space() > 0)
-            .max_by_key(|disk| disk.total_space())
-            .map(|disk| {
-                (disk.total_space() - disk.available_space()) as f32 / disk.total_space() as f32
-                    * 100.0
-            });
+        let disk_usage = select_disk_usage(&self.disks, disk_source);
+        let disk_sensors = disk_sensors(&self.disks);
         let network_download = self
             .networks
             .values()
@@ -156,6 +151,7 @@ impl SensorPoller {
             weather_code: weather.weather_code,
             weather_condition: weather.weather_condition.clone(),
             fan_sensors: hardware.fan_sensors.clone(),
+            disk_sensors,
             ..Default::default()
         }
     }
@@ -216,6 +212,7 @@ pub fn read_snapshot(
     cpu_temperature_source: CpuTemperatureSource,
     cpu_clock_source: CpuClockSource,
     fan_sensor: Option<&str>,
+    disk_source: Option<&str>,
     weather_config: &WeatherConfig,
 ) -> SensorSnapshot {
     let mut poller = SensorPoller::new();
@@ -225,8 +222,64 @@ pub fn read_snapshot(
         cpu_temperature_source,
         cpu_clock_source,
         fan_sensor,
+        disk_source,
         weather_config,
     )
+}
+
+fn disk_id(disk: &Disk) -> String {
+    let mount_point = disk.mount_point().to_string_lossy();
+    if !mount_point.is_empty() {
+        mount_point.into_owned()
+    } else {
+        disk.name().to_string_lossy().into_owned()
+    }
+}
+
+fn disk_label(disk: &Disk) -> String {
+    let id = disk_id(disk);
+    let name = disk.name().to_string_lossy();
+    let size_gb = disk.total_space() as f32 / 1_073_741_824.0;
+    if name.is_empty() || name == id {
+        format!("{id} ({size_gb:.0} GB)")
+    } else {
+        format!("{id} {name} ({size_gb:.0} GB)")
+    }
+}
+
+fn disk_usage_percent(disk: &Disk) -> Option<f32> {
+    (disk.total_space() > 0).then(|| {
+        (disk.total_space() - disk.available_space()) as f32 / disk.total_space() as f32 * 100.0
+    })
+}
+
+fn disk_sensors(disks: &Disks) -> Vec<NamedSensor> {
+    disks
+        .list()
+        .iter()
+        .filter_map(|disk| {
+            disk_usage_percent(disk).map(|value| NamedSensor {
+                id: disk_id(disk),
+                name: disk_label(disk),
+                value,
+            })
+        })
+        .collect()
+}
+
+fn select_disk_usage(disks: &Disks, source: Option<&str>) -> Option<f32> {
+    let valid_disks = || disks.list().iter().filter(|disk| disk.total_space() > 0);
+    source
+        .and_then(|id| {
+            valid_disks()
+                .find(|disk| disk_id(disk) == id)
+                .and_then(disk_usage_percent)
+        })
+        .or_else(|| {
+            valid_disks()
+                .max_by_key(|disk| disk.total_space())
+                .and_then(disk_usage_percent)
+        })
 }
 
 fn resolve_lhm_path(configured_path: Option<&str>) -> Option<PathBuf> {
