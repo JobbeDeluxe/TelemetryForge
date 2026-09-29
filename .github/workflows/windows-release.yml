@@ -38,6 +38,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      - name: Test editor and preview regressions
+        run: |
+          node scripts/test-editor.cjs
+          node scripts/test-preview.cjs
+
       - name: Build release executable
         run: cargo build --release
 
@@ -54,6 +59,7 @@ jobs:
           path: |
             target/release/TelemetryForge.exe
             target/release/TelemetryForge.exe.sha256
+            samples/telemetry.telemetryforge
 
       - name: Create versioned main build
         if: github.ref == 'refs/heads/main'
@@ -66,6 +72,7 @@ jobs:
           gh release create $tag `
             target/release/TelemetryForge.exe `
             target/release/TelemetryForge.exe.sha256 `
+            samples/telemetry.telemetryforge `
             --target $env:GITHUB_SHA `
             --latest `
             --title "TelemetryForge $tag" `
@@ -81,4 +88,4 @@ jobs:
           if ("${{ github.ref_name }}" -ne $expected) {
             throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $expected"
           }
-          gh release create "${{ github.ref_name }}" target/release/TelemetryForge.exe target/release/TelemetryForge.exe.sha256 --generate-notes --title "TelemetryForge ${{ github.ref_name }}"
+          gh release create "${{ github.ref_name }}" target/release/TelemetryForge.exe target/release/TelemetryForge.exe.sha256 samples/telemetry.telemetryforge --generate-notes --title "TelemetryForge ${{ github.ref_name }}"

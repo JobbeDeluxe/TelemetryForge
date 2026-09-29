@@ -12,6 +12,23 @@ pub fn load(name: &str) -> Result<FontArc> {
     if let Some(font) = FONT_CACHE.lock().expect("font cache poisoned").get(name) {
         return Ok(font.clone());
     }
+    let custom = std::path::Path::new(name);
+    if custom.is_file()
+        && custom
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ttf") || ext.eq_ignore_ascii_case("otf"))
+    {
+        anyhow::ensure!(
+            std::fs::metadata(custom)?.len() <= 16 * 1024 * 1024,
+            "Font file exceeds 16 MiB"
+        );
+        let font = FontArc::try_from_vec(std::fs::read(custom)?).context("Invalid font file")?;
+        FONT_CACHE
+            .lock()
+            .expect("font cache poisoned")
+            .insert(name.to_owned(), font.clone());
+        return Ok(font);
+    }
     let requested = match name {
         "Arial" => r"C:\Windows\Fonts\arial.ttf",
         "Arial Bold" => r"C:\Windows\Fonts\arialbd.ttf",

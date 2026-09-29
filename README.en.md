@@ -138,6 +138,13 @@ Circular gauges also support thickness, start angle and sweep angle.
 
 ## Included sample
 
+The **Telemetry** 480×320 screen adds cyan/amber CPU/GPU dials, compact histories,
+temperatures and a RAM/VRAM/disk/volume strip. Import
+[`samples/telemetry.telemetryforge`](samples/telemetry.telemetryforge).
+See the [sample guide](samples/telemetry/README.md) for wallpaper customization.
+
+![Telemetry preview with illustrative readings](samples/telemetry/preview.png)
+
 The repository includes the **MSI Forged Core** 480×320 sample with its
 background, circles, bars and historical graphs. Import
 [`samples/msi-forged-core.telemetryforge`](samples/msi-forged-core.telemetryforge)
@@ -250,6 +257,52 @@ The first Remote Deck MVP does not yet support browser uploads/downloads for
 backgrounds, GIFs, screen packages or `.superwidget` packages. Use the Windows
 application for those file operations.
 
+### Sending text from an external service
+
+Add a **Remote text** widget and give it a stable **Remote text key**, for
+example `game-status`. An external service can then update it immediately with:
+
+```powershell
+Invoke-RestMethod -Method Post `
+  -Uri "http://YOUR-PC-IP:8787/api/widget-text/game-status" `
+  -ContentType "application/json" `
+  -Body '{"text":"Race starts in 10 seconds"}'
+```
+
+The endpoint accepts up to 512 characters and returns JSON. If Remote Deck
+authentication is enabled, send the same HTTP Basic username/password used by
+the browser (for PowerShell: add `-Credential (Get-Credential)`). Incoming text
+is held in memory only: it never overwrites the saved screen and is reset when
+TelemetryForge exits.
+
+For integrations, set a **text API token** (at least 16 characters) in Setup →
+Remote Deck security. Send `Authorization: Bearer YOUR_TOKEN` with the POST.
+This token can update text only; it cannot edit screens, read configuration or
+control the display. Enable username/password authentication to require
+credentials from other callers. Revoke the token using the checkbox in Setup.
+Repeated identical text returns `changed: false` and never triggers transitions
+or changes automation state. Up to 256 distinct text keys are held in memory.
+
+### Reliability and portable packages
+
+Configuration saves use atomic replacement and retain the previous valid YAML
+as `config.yaml.bak` (saved screens have their own `.yaml.bak`). Invalid YAML can
+be recovered from that backup on load.
+
+Packages contain background images, GIFs, slideshow files, Super Widget modules
+and custom font files explicitly selected by path. Installed Windows font
+families remain references and are not automatically redistributed. Package
+imports are bounded to 2048 entries and 256 MiB of extracted content.
+
+The display renderer caches widget layers and honours their refresh intervals.
+Animated GIFs and animated Super Widgets use their own FPS (display loop capped
+at 20 FPS; USB throughput can lower the achieved rate), independently of slow
+sensor frame settings. Static scenes skip unchanged frames and pending layers
+wait until their refresh deadline. Hardware and weather polling run on a
+separate worker. GIFs are limited to 64 MiB/2000 decoded frames each, with a
+128 MiB shared cache. New configurations start with Remote Deck disabled;
+existing users keep their saved setting.
+
 Remote Deck authentication can be enabled from **Remote Deck security** in the
 Windows application. Choose a username and a password of at least eight
 characters. Passwords are stored only as Argon2 hashes. Once enabled, browsers
@@ -261,6 +314,27 @@ router; encrypted remote access will be added separately. Windows may ask for
 firewall permission on first launch—allow private networks only.
 
 ## Troubleshooting
+
+### Live diagnostics and precise editing
+
+Expand **Live diagnostics** below the preview. FPS means successful display
+updates over the previous five seconds, not game FPS. USB timing includes dirty
+region detection and transfer; the byte counter includes RGB565 pixels only.
+Counters reset when rendering starts and exclude the startup animation.
+Near-zero FPS is expected for a static scene. Timing values describe the last
+render/transfer, not continuous CPU usage.
+
+**Sensor health** uses cached readings without extra hardware polling. It shows
+the provider, source-sampling age, missing readings and errors. A real zero is
+not a missing reading. Missing readings in widgets show `--`; stale cached
+weather remains available and is identified in diagnostics. Stop pauses normal
+sensor polling; Test sensors explicitly requests a fresh sample.
+
+Use **Snap grid** (off/4/8/16 px) and **Alignment guides** below the preview.
+Guides snap to widget/display edges and centres. Hold Alt to bypass snapping.
+Select a widget and use arrow keys for 1 px nudges, Shift+arrow for 10 px.
+Groups move together; locked widgets stay fixed. Undo/redo applies to nudges.
+These aids are editor-only and never appear on the USB display or exported PNG.
 
 ### Display not detected
 

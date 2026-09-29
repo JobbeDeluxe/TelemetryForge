@@ -1,6 +1,6 @@
 use super::{
     libre_hardware_monitor::Reader as HardwareReader,
-    model::{NamedSensor, SensorSnapshot},
+    model::{timestamp_ms, NamedSensor, SensorInfo, SensorSnapshot},
     weather,
     windows_volume::Reader as VolumeReader,
 };
@@ -24,6 +24,11 @@ pub struct SensorPoller {
     volume_reader: VolumeReader,
     weather_snapshot: SensorSnapshot,
     last_weather_refresh: Option<Instant>,
+    hardware_sampled_at: Option<u64>,
+    weather_sampled_at: Option<u64>,
+    hardware_error: Option<String>,
+    weather_error: Option<String>,
+    weather_config: Option<WeatherConfig>,
 }
 
 impl SensorPoller {
@@ -50,6 +55,11 @@ impl SensorPoller {
             volume_reader: VolumeReader::new(),
             weather_snapshot: SensorSnapshot::default(),
             last_weather_refresh: None,
+            hardware_sampled_at: None,
+            weather_sampled_at: None,
+            hardware_error: None,
+            weather_error: None,
+            weather_config: None,
         }
     }
 
@@ -70,10 +80,15 @@ impl SensorPoller {
         self.system.refresh_memory();
         self.networks.refresh(true);
         self.disks.refresh(false);
+        let system_sampled_at = timestamp_ms();
         let network_interval = self.last_network_refresh.elapsed().as_secs_f32().max(0.001);
         self.last_network_refresh = Instant::now();
 
-        let disk_usage = select_disk_usage(&self.disks, disk_source);
+        let selected_disk = select_disk(&self.disks, disk_source);
+        let disk_usage = selected_disk.and_then(disk_usage_percent);
+        let actual_disk = selected_disk
+            .map(disk_label)
+            .unwrap_or_else(|| "unavailable".into());
         let disk_sensors = disk_sensors(&self.disks);
         let network_download = self
             .networks
@@ -98,21 +113,38 @@ impl SensorPoller {
             self.last_hardware_refresh = Some(Instant::now());
         }
         let hardware = &self.hardware_snapshot;
+        if self.weather_config.as_ref() != Some(weather_config) {
+            self.weather_config = Some(weather_config.clone());
+            self.weather_snapshot = SensorSnapshot::default();
+            self.weather_sampled_at = None;
+            self.last_weather_refresh = None;
+            self.weather_error = None;
+        }
         let weather_due = weather_config.enabled
             && self.last_weather_refresh.is_none_or(|last| {
                 last.elapsed() >= Duration::from_secs(weather_config.refresh_minutes.max(5) * 60)
             });
         if weather_due {
             match weather::read(weather_config) {
-                Ok(snapshot) => self.weather_snapshot = snapshot,
+                Ok(snapshot) => {
+                    self.weather_snapshot = snapshot;
+                    self.weather_sampled_at = Some(timestamp_ms());
+                    self.weather_error = None;
+                }
                 Err(error) => {
+                    self.weather_error = Some(format!("{error:#}"));
                     tracing::warn!(error = %format!("{error:#}"), "weather refresh failed")
                 }
             }
             self.last_weather_refresh = Some(Instant::now());
         }
-        let weather = &self.weather_snapshot;
-        SensorSnapshot {
+        let disabled_weather = SensorSnapshot::default();
+        let weather = if weather_config.enabled {
+            &self.weather_snapshot
+        } else {
+            &disabled_weather
+        };
+        let mut snapshot = SensorSnapshot {
             cpu_temperature: select_cpu_temperature(hardware, cpu_temperature_source),
             cpu_temperature_core: hardware.cpu_temperature_core,
             cpu_temperature_socket: hardware.cpu_temperature_socket,
@@ -153,26 +185,185 @@ impl SensorPoller {
             fan_sensors: hardware.fan_sensors.clone(),
             disk_sensors,
             ..Default::default()
+        };
+        let cpu_temperature_source = match cpu_temperature_source {
+            CpuTemperatureSource::Socket if hardware.cpu_temperature_socket.is_some() => "socket",
+            _ if hardware.cpu_temperature_core.is_some() => "core/package",
+            _ if hardware.cpu_temperature_socket.is_some() => "socket (fallback)",
+            _ => "automatic",
+        };
+        let cpu_clock_source = match cpu_clock_source {
+            CpuClockSource::Effective if hardware.cpu_clock_effective.is_some() => "effective",
+            _ if hardware.cpu_clock_average.is_some() => "average",
+            _ => "effective (fallback)",
+        };
+        let actual_fan = fan_sensor
+            .and_then(|id| hardware.fan_sensors.iter().find(|sensor| sensor.id == id))
+            .map(|sensor| format!("{} ({})", sensor.name, sensor.id))
+            .unwrap_or_else(|| "automatic".into());
+        let hardware_stale = (self.hardware_refresh_interval.as_millis() as u64 * 3).max(10_000);
+        for (key, value, unit, source, hardware_sensor) in [
+            (
+                "CPU usage",
+                snapshot.cpu_usage,
+                "%",
+                "Windows / sysinfo".to_string(),
+                false,
+            ),
+            (
+                "CPU temperature",
+                snapshot.cpu_temperature,
+                "°C",
+                format!("LibreHardwareMonitor / {cpu_temperature_source}"),
+                true,
+            ),
+            (
+                "CPU clock",
+                snapshot.cpu_clock,
+                "MHz",
+                format!("LibreHardwareMonitor / {cpu_clock_source}"),
+                true,
+            ),
+            (
+                "GPU usage",
+                snapshot.gpu_usage,
+                "%",
+                "LibreHardwareMonitor".into(),
+                true,
+            ),
+            (
+                "GPU temperature",
+                snapshot.gpu_temperature,
+                "°C",
+                "LibreHardwareMonitor".into(),
+                true,
+            ),
+            (
+                "GPU clock",
+                snapshot.gpu_clock,
+                "MHz",
+                "LibreHardwareMonitor".into(),
+                true,
+            ),
+            (
+                "GPU power",
+                snapshot.gpu_power,
+                "W",
+                "LibreHardwareMonitor".into(),
+                true,
+            ),
+            (
+                "RAM",
+                snapshot.ram_usage,
+                "%",
+                "Windows / sysinfo".into(),
+                false,
+            ),
+            (
+                "VRAM",
+                snapshot.vram_usage,
+                "%",
+                "LibreHardwareMonitor".into(),
+                true,
+            ),
+            (
+                "Disk",
+                snapshot.disk_usage,
+                "%",
+                format!("Windows / sysinfo / {actual_disk}"),
+                false,
+            ),
+            (
+                "Fan",
+                snapshot.fan_speed,
+                "rpm",
+                format!("LibreHardwareMonitor / {actual_fan}"),
+                true,
+            ),
+            (
+                "Download",
+                snapshot.network_download,
+                "KB/s",
+                "Windows / sysinfo".into(),
+                false,
+            ),
+            (
+                "Upload",
+                snapshot.network_upload,
+                "KB/s",
+                "Windows / sysinfo".into(),
+                false,
+            ),
+            (
+                "Volume",
+                snapshot.system_volume,
+                "%",
+                "Windows Core Audio".into(),
+                false,
+            ),
+        ] {
+            snapshot.sensor_info.push(SensorInfo {
+                key: key.into(),
+                value,
+                unit: unit.into(),
+                source,
+                sampled_at_ms: if hardware_sensor {
+                    self.hardware_sampled_at
+                } else {
+                    Some(system_sampled_at)
+                },
+                stale_after_ms: if hardware_sensor {
+                    hardware_stale
+                } else {
+                    10_000
+                },
+                error: if hardware_sensor {
+                    self.hardware_error.clone()
+                } else {
+                    None
+                },
+            });
         }
-    }
-
-    pub fn read_system_volume(&mut self) -> Option<f32> {
-        self.volume_reader.read()
+        snapshot.sensor_info.push(SensorInfo {
+            key: "Weather".into(),
+            value: snapshot.weather_temperature,
+            unit: "°C".into(),
+            source: "Open-Meteo".into(),
+            sampled_at_ms: if weather_config.enabled {
+                self.weather_sampled_at
+            } else {
+                None
+            },
+            stale_after_ms: weather_config
+                .refresh_minutes
+                .max(5)
+                .saturating_mul(120_000),
+            error: if weather_config.enabled {
+                self.weather_error.clone()
+            } else {
+                Some("Weather is disabled".into())
+            },
+        });
+        snapshot
     }
 
     fn refresh_hardware(&mut self, configured_path: Option<&str>) {
         let path = resolve_lhm_path(configured_path);
         if path != self.hardware_path {
             self.hardware_reader = None;
+            self.hardware_snapshot = SensorSnapshot::default();
             self.hardware_path = path.clone();
+            self.hardware_sampled_at = None;
         }
         let Some(path) = path else {
+            self.hardware_error = Some("LibreHardwareMonitor DLL not found".into());
             return;
         };
         if self.hardware_reader.is_none() {
             match HardwareReader::start(&path) {
                 Ok(reader) => self.hardware_reader = Some(reader),
                 Err(error) => {
+                    self.hardware_error = Some(format!("{error:#}"));
                     tracing::error!(
                         dll = %path.display(),
                         error = %format!("{error:#}"),
@@ -188,14 +379,20 @@ impl SensorPoller {
             .expect("hardware reader initialized")
             .read();
         match result {
-            Ok(snapshot) => self.hardware_snapshot = snapshot,
+            Ok(snapshot) => {
+                self.hardware_snapshot = snapshot;
+                self.hardware_sampled_at = Some(timestamp_ms());
+                self.hardware_error = None;
+            }
             Err(error) => {
+                self.hardware_error = Some(format!("{error:#}"));
                 tracing::error!(
                     dll = %path.display(),
                     error = %format!("{error:#}"),
                     "LibreHardwareMonitor read failed"
                 );
                 self.hardware_reader = None;
+                self.hardware_snapshot = SensorSnapshot::default();
             }
         }
     }
@@ -267,19 +464,11 @@ fn disk_sensors(disks: &Disks) -> Vec<NamedSensor> {
         .collect()
 }
 
-fn select_disk_usage(disks: &Disks, source: Option<&str>) -> Option<f32> {
+fn select_disk<'a>(disks: &'a Disks, source: Option<&str>) -> Option<&'a Disk> {
     let valid_disks = || disks.list().iter().filter(|disk| disk.total_space() > 0);
     source
-        .and_then(|id| {
-            valid_disks()
-                .find(|disk| disk_id(disk) == id)
-                .and_then(disk_usage_percent)
-        })
-        .or_else(|| {
-            valid_disks()
-                .max_by_key(|disk| disk.total_space())
-                .and_then(disk_usage_percent)
-        })
+        .and_then(|id| valid_disks().find(|disk| disk_id(disk) == id))
+        .or_else(|| valid_disks().max_by_key(|disk| disk.total_space()))
 }
 
 fn resolve_lhm_path(configured_path: Option<&str>) -> Option<PathBuf> {

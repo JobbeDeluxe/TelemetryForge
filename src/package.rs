@@ -1,4 +1,7 @@
-use crate::config::{persistence, schema::AppConfig};
+use crate::config::{
+    persistence,
+    schema::{AppConfig, BackgroundSource},
+};
 use anyhow::{Context, Result};
 use std::{
     fs::{self, File},
@@ -11,14 +14,52 @@ pub fn export(path: &Path, config: &AppConfig) -> Result<()> {
     let file = File::create(path)?;
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    config.validate()?;
     let mut portable = config.clone();
+    portable.remote = Default::default();
+    portable.libre_hardware_monitor_dll = None;
 
     if let Some(source) = portable.background.path.clone() {
         portable.background.path = add_asset(&mut zip, &source, "background", options)?;
     }
+    if portable.background.source == BackgroundSource::Folder {
+        if let Some(folder) = portable.background.folder.clone() {
+            for entry in fs::read_dir(&folder)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_file()
+                    && path.extension().is_some_and(|ext| {
+                        matches!(
+                            ext.to_string_lossy().to_ascii_lowercase().as_str(),
+                            "png" | "jpg" | "jpeg" | "bmp" | "gif"
+                        )
+                    })
+                {
+                    let name = format!("slideshow/{}", entry.file_name().to_string_lossy());
+                    zip.start_file(name, options)?;
+                    std::io::copy(&mut File::open(path)?, &mut zip)?;
+                }
+            }
+            portable.background.folder = Some("slideshow".into());
+        }
+    }
+    let mut components = std::collections::HashSet::new();
     for (index, widget) in portable.widgets.iter_mut().enumerate() {
         if let Some(source) = widget.gif_path.clone() {
             widget.gif_path = add_asset(&mut zip, &source, &format!("gif-{index}"), options)?;
+        }
+        // Only explicitly selected font files are embedded. Installed Windows
+        // fonts keep their family name and are not redistributed implicitly.
+        if Path::new(&widget.font).is_file() {
+            widget.font = add_asset(&mut zip, &widget.font, &format!("font-{index}"), options)?
+                .unwrap_or_default();
+        }
+        if let Some(id) = widget.superwidget_id.as_deref() {
+            if components.insert(id.to_string()) {
+                let bytes = crate::superwidgets::export_bytes(id)?;
+                zip.start_file(format!("components/{id}.superwidget"), options)?;
+                zip.write_all(&bytes)?;
+            }
         }
     }
 
@@ -29,35 +70,37 @@ pub fn export(path: &Path, config: &AppConfig) -> Result<()> {
 }
 
 pub fn import(path: &Path, name: &str) -> Result<AppConfig> {
-    let destination = persistence::data_dir()
-        .join("packages")
-        .join(safe_name(name));
-    fs::create_dir_all(&destination)?;
+    let parent = persistence::data_dir().join("packages");
+    let staging = crate::safe_files::Staging::new(&parent)?;
+    let destination = crate::safe_files::unique_path(&parent, &safe_name(name));
     let mut archive = ZipArchive::new(File::open(path)?)?;
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index)?;
-        let Some(relative) = entry.enclosed_name() else {
-            continue;
-        };
-        let output = destination.join(relative);
-        if entry.is_dir() {
-            fs::create_dir_all(&output)?;
-        } else {
-            if let Some(parent) = output.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut file = File::create(output)?;
-            std::io::copy(&mut entry, &mut file)?;
-        }
-    }
+    crate::safe_files::extract(&mut archive, &staging.0)?;
     let mut config: AppConfig = serde_yaml::from_str(
-        &fs::read_to_string(destination.join("config.yaml"))
+        &fs::read_to_string(staging.0.join("config.yaml"))
             .context("Package does not contain config.yaml")?,
     )?;
-    resolve_asset(&destination, &mut config.background.path);
+    config.validate()?;
+    resolve_asset(&staging.0, &destination, &mut config.background.path)?;
+    resolve_asset(&staging.0, &destination, &mut config.background.folder)?;
     for widget in &mut config.widgets {
-        resolve_asset(&destination, &mut widget.gif_path);
+        resolve_asset(&staging.0, &destination, &mut widget.gif_path)?;
+        if widget.font.starts_with("assets/") {
+            let mut font = Some(widget.font.clone());
+            resolve_asset(&staging.0, &destination, &mut font)?;
+            widget.font = font.unwrap_or_default();
+        }
     }
+    let components = staging.0.join("components");
+    if components.is_dir() {
+        for entry in fs::read_dir(components)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "superwidget") {
+                crate::superwidgets::install(&path)?;
+            }
+        }
+    }
+    fs::rename(&staging.0, &destination)?;
+    config.remote = Default::default();
     Ok(config)
 }
 
@@ -84,12 +127,19 @@ fn add_asset(
     Ok(Some(archive_path))
 }
 
-fn resolve_asset(root: &Path, value: &mut Option<String>) {
+fn resolve_asset(staging: &Path, root: &Path, value: &mut Option<String>) -> Result<()> {
     if let Some(path) = value.as_deref() {
-        if !Path::new(path).is_absolute() {
-            *value = Some(root.join(path).to_string_lossy().into_owned());
-        }
+        anyhow::ensure!(
+            crate::safe_files::safe_relative(Path::new(path)),
+            "Unsafe package asset path"
+        );
+        anyhow::ensure!(
+            staging.join(path).exists(),
+            "Package asset is missing: {path}"
+        );
+        *value = Some(root.join(path).to_string_lossy().into_owned());
     }
+    Ok(())
 }
 
 fn safe_name(name: &str) -> String {
@@ -130,6 +180,8 @@ mod tests {
         let package = root.join("sample.telemetryforge");
 
         let mut config = AppConfig::default();
+        config.remote.password_hash = "must-not-be-exported".into();
+        config.remote.text_token_hash = "must-not-be-exported-either".into();
         config.background.source = BackgroundSource::File;
         config.background.path = Some(background.to_string_lossy().into_owned());
         let mut widget = WidgetConfig::new(WidgetKind::Gif, 0, 0, "");
@@ -138,8 +190,33 @@ mod tests {
 
         export(&package, &config).unwrap();
         let imported = import(&package, "package-test").unwrap();
+        assert!(imported.remote.password_hash.is_empty());
+        assert!(imported.remote.text_token_hash.is_empty());
         assert!(Path::new(imported.background.path.as_deref().unwrap()).is_file());
         assert!(Path::new(imported.widgets[0].gif_path.as_deref().unwrap()).is_file());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn package_round_trip_embeds_slideshow_and_custom_font() {
+        let root = crate::safe_files::Staging::new(&std::env::temp_dir()).unwrap();
+        let slides = root.0.join("slides");
+        fs::create_dir(&slides).unwrap();
+        fs::write(slides.join("one.png"), b"slide-bytes").unwrap();
+        let font = root.0.join("custom.ttf");
+        fs::write(&font, b"font-bytes").unwrap();
+        let mut config = AppConfig::default();
+        config.background.source = BackgroundSource::Folder;
+        config.background.folder = Some(slides.to_string_lossy().into_owned());
+        config.widgets[0].font = font.to_string_lossy().into_owned();
+        let package = root.0.join("slides.telemetryforge");
+        export(&package, &config).unwrap();
+        let imported = import(&package, "slides-test").unwrap();
+        assert_eq!(
+            fs::read(Path::new(imported.background.folder.as_deref().unwrap()).join("one.png"))
+                .unwrap(),
+            b"slide-bytes"
+        );
+        assert_eq!(fs::read(&imported.widgets[0].font).unwrap(), b"font-bytes");
     }
 }

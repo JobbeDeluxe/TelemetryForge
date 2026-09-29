@@ -5,7 +5,9 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::windows::process::CommandExt,
     path::Path,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc::{self, Receiver},
+    time::Duration,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -32,7 +34,8 @@ struct LhmOutput {
 pub struct Reader {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    output: Receiver<std::io::Result<String>>,
+    first_read: bool,
 }
 
 impl Reader {
@@ -63,21 +66,44 @@ impl Reader {
             .stdout
             .take()
             .context("Bridge stdout is unavailable")?;
+        let (send, output) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                let result = reader.read_line(&mut line).and_then(|size| {
+                    if size == 0 {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "Hardware bridge exited",
+                        ))
+                    } else {
+                        Ok(line)
+                    }
+                });
+                let failed = result.is_err();
+                if send.send(result).is_err() || failed {
+                    break;
+                }
+            }
+        });
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            output,
+            first_read: true,
         })
     }
 
     pub fn read(&mut self) -> Result<SensorSnapshot> {
         self.stdin.write_all(b"read\n")?;
         self.stdin.flush()?;
-        let mut line = String::new();
-        let size = self.stdout.read_line(&mut line)?;
-        if size == 0 {
-            anyhow::bail!("LibreHardwareMonitor bridge stopped unexpectedly");
-        }
+        let timeout = if self.first_read { 20 } else { 5 };
+        self.first_read = false;
+        let line = self
+            .output
+            .recv_timeout(Duration::from_secs(timeout))
+            .context("LibreHardwareMonitor bridge timed out or disconnected")??;
         parse(&line)
     }
 }

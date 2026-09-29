@@ -16,28 +16,42 @@ pub fn draw(
     background_opacity: f32,
     bindings: &std::collections::HashMap<String, String>,
 ) -> Result<RgbaImage> {
-    if manifest.runtime == "wasm" {
+    let rendered = if manifest.runtime == "wasm" {
         let entry = manifest.entry.as_deref().unwrap_or("widget.wasm");
-        return super::wasm_runtime::render(
+        let mut bound = sensors.clone();
+        if let Some(id) = bindings.get("fan").filter(|id| !id.is_empty()) {
+            bound.fan_speed = sensors
+                .fan_sensors
+                .iter()
+                .find(|sensor| &sensor.id == id)
+                .map(|sensor| sensor.value);
+        }
+        match bindings.get("temperature").map(String::as_str) {
+            Some("cpu_core") => bound.cpu_temperature = sensors.cpu_temperature_core,
+            Some("cpu_socket") => bound.cpu_temperature = sensors.cpu_temperature_socket,
+            _ => {}
+        }
+        super::wasm_runtime::render(
             &super::component_dir(&manifest.id).join(entry),
             width,
             height,
-            sensors,
-        );
-    }
-    let temperature = selected_temperature(manifest, sensors, bindings);
-    let fan_speed = selected_fan(sensors, bindings);
-    let source = match manifest.template.as_str() {
-        "cpu_command_dial" => cpu_command_dial(sensors, temperature, fan_speed)?,
-        "gpu_command_dial" => gpu_command_dial(sensors, temperature, fan_speed)?,
-        _ => RgbaImage::new(DESIGN_SIZE, DESIGN_SIZE),
+            &bound,
+        )?
+    } else {
+        let temperature = selected_temperature(manifest, sensors, bindings);
+        let fan_speed = selected_fan(sensors, bindings);
+        let source = match manifest.template.as_str() {
+            "cpu_command_dial" => cpu_command_dial(sensors, temperature, fan_speed)?,
+            "gpu_command_dial" => gpu_command_dial(sensors, temperature, fan_speed)?,
+            _ => RgbaImage::new(DESIGN_SIZE, DESIGN_SIZE),
+        };
+        imageops::resize(
+            &source,
+            width.max(1),
+            height.max(1),
+            imageops::FilterType::Lanczos3,
+        )
     };
-    let rendered = imageops::resize(
-        &source,
-        width.max(1),
-        height.max(1),
-        imageops::FilterType::Lanczos3,
-    );
     if background_opacity <= 0.0 {
         return Ok(rendered);
     }

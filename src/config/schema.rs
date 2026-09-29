@@ -47,6 +47,7 @@ pub struct RemoteConfig {
     pub authentication_enabled: bool,
     pub username: String,
     pub password_hash: String,
+    pub text_token_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -199,6 +200,10 @@ pub struct WidgetConfig {
     pub enabled: bool,
     pub left_text: String,
     pub right_text: String,
+    /// Stable endpoint key for a Remote Text widget. It is intentionally
+    /// separate from the visible label/format so changing its style does not
+    /// break external integrations.
+    pub remote_text_key: String,
     pub x: i32,
     pub y: i32,
     pub width: u32,
@@ -252,6 +257,7 @@ pub enum WidgetKind {
     Date,
     Fps,
     Text,
+    RemoteText,
     Gif,
     Volume,
     WeatherTemperature,
@@ -303,10 +309,11 @@ impl Default for AppConfig {
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             authentication_enabled: false,
             username: "admin".into(),
             password_hash: String::new(),
+            text_token_hash: String::new(),
         }
     }
 }
@@ -423,6 +430,68 @@ impl Default for ThemeConfig {
     }
 }
 
+impl AppConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.display.width > 0
+                && self.display.height > 0
+                && self.display.width <= 4096
+                && self.display.height <= 4096,
+            "Display dimensions must be between 1 and 4096"
+        );
+        anyhow::ensure!(
+            self.widgets.len() <= 256,
+            "A screen supports up to 256 widgets"
+        );
+        let mut pixels = 0u64;
+        for w in &self.widgets {
+            anyhow::ensure!(
+                w.x.unsigned_abs() <= 32768 && w.y.unsigned_abs() <= 32768,
+                "Widget position is outside the supported range"
+            );
+            anyhow::ensure!(
+                w.width > 0 && w.height > 0 && w.width <= 2048 && w.height <= 2048,
+                "Widget dimensions must be between 1 and 2048"
+            );
+            pixels += (w.width as u64 + 128) * (w.height as u64 + 128);
+            anyhow::ensure!(
+                w.font_size.is_finite()
+                    && (1.0..=512.0).contains(&w.font_size)
+                    && w.opacity.is_finite()
+                    && w.circle_thickness.is_finite()
+                    && w.circle_start_angle.is_finite()
+                    && w.circle_sweep_angle.is_finite(),
+                "Invalid widget font size or visual parameters"
+            );
+            anyhow::ensure!(
+                w.circle_thickness.abs() <= 512.0 && w.circle_sweep_angle.abs() <= 360.0,
+                "Invalid circle thickness or sweep"
+            );
+            anyhow::ensure!(
+                w.label_format.len() <= 8192
+                    && w.left_text.len() <= 4096
+                    && w.right_text.len() <= 4096,
+                "Widget text is too long"
+            );
+            if w.kind == WidgetKind::RemoteText {
+                anyhow::ensure!(
+                    !w.remote_text_key.is_empty()
+                        && w.remote_text_key.len() <= 64
+                        && w.remote_text_key
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')),
+                    "Remote text keys must contain 1–64 letters, numbers, -, _ or ."
+                );
+            }
+        }
+        anyhow::ensure!(
+            pixels <= 32 * 1024 * 1024,
+            "Screen exceeds the widget pixel budget"
+        );
+        Ok(())
+    }
+}
+
 impl Default for WidgetConfig {
     fn default() -> Self {
         Self::new(WidgetKind::Clock, 20, 20, "{value}")
@@ -440,6 +509,7 @@ impl WidgetConfig {
             enabled: true,
             left_text: String::new(),
             right_text: String::new(),
+            remote_text_key: "status".into(),
             x,
             y,
             width: 210,

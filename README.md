@@ -1,5 +1,9 @@
 # TelemetryForge
 
+For the current reliability improvements, remote text API/token setup and
+portable-package behaviour, see the [English usage guide](README.en.md) and
+[code changes](CODE_CHANGES.md).
+
 An open-source Windows desktop application for TURZX/Turing Smart Screen
 3.5-inch USB displays normally controlled by `UsbMonitor.exe`.
 
@@ -21,6 +25,12 @@ Weather data attribution: [Open-Meteo.com](https://open-meteo.com/),
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 ## Included sample
+
+Try the new **Telemetry** screen: [download the importable package](samples/telemetry.telemetryforge)
+or read the [sample guide](samples/telemetry/README.md). Cyan/amber CPU and GPU
+dials, compact histories, and a resource strip, with a neutral TF background.
+
+<p align="center"><img src="samples/telemetry/preview.png" width="480" alt="Telemetry screen preview with illustrative sensor values" /></p>
 
 Import [`samples/msi-forged-core.telemetryforge`](samples/msi-forged-core.telemetryforge)
 to use the 480×320 **MSI Forged Core** screen, including its background and

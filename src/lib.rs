@@ -5,7 +5,10 @@ mod package;
 mod remote_auth;
 mod remote_server;
 mod renderer;
+mod safe_files;
 mod scene;
+#[cfg(test)]
+mod screen_design;
 mod sensors;
 mod superwidgets;
 mod ui;

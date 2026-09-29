@@ -50,7 +50,7 @@ pub fn save_active_screen(config_path: &Path, name: Option<&str>) -> Result<()> 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, name.trim())?;
+        crate::safe_files::atomic_write(&path, name.trim().as_bytes())?;
     } else if path.exists() {
         fs::remove_file(path)?;
     }
@@ -122,15 +122,43 @@ pub fn load_or_create(path: &Path) -> Result<AppConfig> {
     }
     let yaml =
         fs::read_to_string(path).with_context(|| format!("Could not read {}", path.display()))?;
-    serde_yaml::from_str(&yaml).context("Invalid config.yaml")
+    match serde_yaml::from_str::<AppConfig>(&yaml) {
+        Ok(config) => {
+            config.validate()?;
+            Ok(config)
+        }
+        Err(error) => {
+            let backup = path.with_extension("yaml.bak");
+            let recovered: AppConfig =
+                serde_yaml::from_str(&fs::read_to_string(&backup).with_context(|| {
+                    format!("Invalid configuration ({error}); no readable backup")
+                })?)?;
+            recovered.validate()?;
+            tracing::warn!(path = %path.display(), "Recovered configuration from backup");
+            crate::safe_files::atomic_write(path, serde_yaml::to_string(&recovered)?.as_bytes())?;
+            Ok(recovered)
+        }
+    }
 }
 
 pub fn save(path: &Path, config: &AppConfig) -> Result<()> {
+    static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SAVE_LOCK.lock().expect("configuration save lock poisoned");
+    config.validate()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let yaml = serde_yaml::to_string(config)?;
-    fs::write(path, yaml).with_context(|| format!("Could not save {}", path.display()))
+    if let Ok(previous) = fs::read(path) {
+        if previous == yaml.as_bytes() {
+            return Ok(());
+        }
+        if serde_yaml::from_slice::<AppConfig>(&previous).is_ok() {
+            crate::safe_files::atomic_write(&path.with_extension("yaml.bak"), &previous)?;
+        }
+    }
+    crate::safe_files::atomic_write(path, yaml.as_bytes())
+        .with_context(|| format!("Could not save {}", path.display()))
 }
 
 pub fn profiles_dir(config_path: &Path) -> PathBuf {
@@ -177,6 +205,20 @@ pub fn list_profiles(config_path: &Path) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovers_previous_configuration_after_corruption() {
+        let root = crate::safe_files::Staging::new(&std::env::temp_dir()).unwrap();
+        let path = root.0.join("config.yaml");
+        let mut config = AppConfig::default();
+        config.theme.name = "Backup".into();
+        save(&path, &config).unwrap();
+        config.theme.name = "Latest".into();
+        save(&path, &config).unwrap();
+        fs::write(&path, "invalid: [").unwrap();
+        assert_eq!(load_or_create(&path).unwrap().theme.name, "Backup");
+        assert_eq!(load_or_create(&path).unwrap().theme.name, "Backup");
+    }
 
     #[test]
     fn infers_the_active_screen_from_the_saved_config() {

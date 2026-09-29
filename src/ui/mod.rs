@@ -41,6 +41,9 @@ fn merge_screen_settings(mut screen: AppConfig, current: &AppConfig) -> AppConfi
 pub struct Status {
     pub running: bool,
     pub message: String,
+    pub diagnostics: crate::app_state::Diagnostics,
+    pub sensor_info: Vec<crate::sensors::model::SensorInfo>,
+    pub server_time_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -51,6 +54,7 @@ pub struct RemoteInfo {
     pub warning: String,
     pub authentication_enabled: bool,
     pub username: String,
+    pub text_token_configured: bool,
 }
 
 #[derive(Serialize)]
@@ -68,7 +72,7 @@ pub fn remote_info_state(state: &AppState) -> RemoteInfo {
     let config = state.config.read();
     RemoteInfo {
         enabled: config.remote.enabled,
-        server_running: config.remote.enabled,
+        server_running: state.remote_running.load(Ordering::Relaxed),
         url: format!("http://{}:8787", local_network_address()),
         warning: if config.remote.authentication_enabled {
             "Remote Deck is protected by username and password.".into()
@@ -77,6 +81,7 @@ pub fn remote_info_state(state: &AppState) -> RemoteInfo {
         },
         authentication_enabled: config.remote.authentication_enabled,
         username: config.remote.username.clone(),
+        text_token_configured: !config.remote.text_token_hash.is_empty(),
     }
 }
 
@@ -86,6 +91,10 @@ pub struct RemoteSecurityUpdate {
     pub authentication_enabled: bool,
     pub username: String,
     pub password: String,
+    #[serde(default)]
+    pub text_token: String,
+    #[serde(default)]
+    pub clear_text_token: bool,
 }
 
 #[tauri::command]
@@ -105,7 +114,8 @@ pub fn set_remote_security_state(
     if settings.authentication_enabled && username.is_empty() {
         return Err("Username cannot be empty".into());
     }
-    let mut config = state.config.write();
+    let mut guard = state.config.write();
+    let mut config = guard.clone();
     config.remote.enabled = settings.enabled;
     config.remote.username = if username.is_empty() {
         "admin".into()
@@ -119,7 +129,18 @@ pub fn set_remote_security_state(
         return Err("Set a password before enabling authentication".into());
     }
     config.remote.authentication_enabled = settings.authentication_enabled;
-    persistence::save(&state.config_path, &config).map_err(|error| error.to_string())
+    if settings.clear_text_token {
+        config.remote.text_token_hash.clear();
+    }
+    if !settings.text_token.is_empty() {
+        if settings.text_token.len() < 16 {
+            return Err("Text API token must contain at least 16 characters".into());
+        }
+        config.remote.text_token_hash = crate::remote_auth::hash_password(&settings.text_token)?;
+    }
+    persistence::save(&state.config_path, &config).map_err(|error| error.to_string())?;
+    *guard = config;
+    Ok(())
 }
 
 fn local_network_address() -> String {
@@ -139,11 +160,13 @@ pub fn get_config(state: State<AppState>) -> AppConfig {
 
 pub fn public_config(mut config: AppConfig) -> AppConfig {
     config.remote.password_hash.clear();
+    config.remote.text_token_hash.clear();
     config
 }
 
 pub fn profile_config(mut config: AppConfig) -> AppConfig {
     config.remote.password_hash.clear();
+    config.remote.text_token_hash.clear();
     config
 }
 
@@ -316,7 +339,9 @@ pub async fn share_package(
     let preview_path = package_path.with_extension("preview.png");
     package::export(&package_path, &config).map_err(|error| error.to_string())?;
     let sensors = state.sensors.read().clone();
-    let preview = renderer::render(&config, &sensors).map_err(|error| error.to_string())?;
+    let remote_texts = state.remote_texts.read().clone();
+    let preview =
+        renderer::render(&config, &sensors, &remote_texts).map_err(|error| error.to_string())?;
     let png = renderer::canvas::png_bytes(&preview).map_err(|error| error.to_string())?;
     std::fs::write(&preview_path, png).map_err(|error| error.to_string())?;
     Ok(Some(ShareExportResult {
@@ -377,7 +402,8 @@ pub async fn import_package(
 pub fn get_preview(state: State<AppState>) -> Result<String, String> {
     let config = state.config.read().clone();
     let sensors = state.sensors.read().clone();
-    let image = renderer::render(&config, &sensors).map_err(|e| e.to_string())?;
+    let remote_texts = state.remote_texts.read().clone();
+    let image = renderer::render(&config, &sensors, &remote_texts).map_err(|e| e.to_string())?;
     let png = renderer::canvas::png_bytes(&image).map_err(|e| e.to_string())?;
     Ok(format!("data:image/png;base64,{}", STANDARD.encode(png)))
 }
@@ -385,7 +411,8 @@ pub fn get_preview(state: State<AppState>) -> Result<String, String> {
 #[tauri::command]
 pub fn preview_config(state: State<AppState>, config: AppConfig) -> Result<String, String> {
     let sensors = state.sensors.read().clone();
-    let image = renderer::render(&config, &sensors).map_err(|e| e.to_string())?;
+    let remote_texts = state.remote_texts.read().clone();
+    let image = renderer::render(&config, &sensors, &remote_texts).map_err(|e| e.to_string())?;
     let png = renderer::canvas::png_bytes(&image).map_err(|e| e.to_string())?;
     Ok(format!("data:image/png;base64,{}", STANDARD.encode(png)))
 }
@@ -470,7 +497,8 @@ pub fn render_once(state: State<AppState>) -> Result<(), String> {
         config.disk_source.as_deref(),
         &config.weather,
     );
-    let image = renderer::render(&config, &snapshot).map_err(|e| e.to_string())?;
+    let remote_texts = state.remote_texts.read().clone();
+    let image = renderer::render(&config, &snapshot, &remote_texts).map_err(|e| e.to_string())?;
     display_driver::send_frame(&config.display, &image).map_err(|e| e.to_string())?;
     *state.sensors.write() = snapshot;
     *state.status.write() = "Frame sent".into();
@@ -529,40 +557,72 @@ pub fn start_rendering_from_windows_startup(state: State<AppState>) -> Result<()
 
 fn start_rendering_with_boot(state: &AppState, allow_boot_animation: bool) -> Result<(), String> {
     let mut worker = state.worker.lock();
-    if worker.is_some() {
-        return Ok(());
+    if worker
+        .as_ref()
+        .is_some_and(|worker| worker.handle.is_finished())
+    {
+        if let Some(previous) = worker.take() {
+            let _ = previous.handle.join();
+        }
+    }
+    if let Some(worker) = worker.as_ref() {
+        return if worker.stop.load(Ordering::Relaxed) {
+            Err("Rendering is stopping; please wait for the sensor worker to finish".into())
+        } else {
+            Ok(())
+        };
     }
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = stop.clone();
     let config = state.config.clone();
     let sensors = state.sensors.clone();
+    let remote_texts = state.remote_texts.clone();
     let status = state.status.clone();
+    let diagnostics = state.diagnostics.clone();
+    *diagnostics.write() = Default::default();
     let scene_revision = state.scene_revision.clone();
     let active_screen_state = state.active_screen.clone();
     let config_path = state.config_path.clone();
-    thread::Builder::new()
+    let handle = thread::Builder::new()
         .name("telemetryforge-renderer".into())
         .spawn(move || {
             let initial = config.read().clone();
             let mut session = display_driver::DisplaySession::connect(&initial.display).ok();
-            let mut sensor_poller = poller::SensorPoller::new();
-            thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-            let mut target = sensor_poller.read(
-                initial.libre_hardware_monitor_dll.as_deref(),
-                initial.cpu_temperature_source,
-                initial.cpu_clock_source,
-                initial.fan_sensor.as_deref(),
-                initial.disk_source.as_deref(),
-                &initial.weather,
-            );
+            let mut connected_display = initial.display.clone();
+            let mut boot_pending = allow_boot_animation && initial.effects.boot_animation_enabled;
+            let sensor_stop = thread_stop.clone();
+            let sensor_config = config.clone();
+            let latest = Arc::new(parking_lot::RwLock::new(sensors.read().clone()));
+            let sensor_latest = latest.clone();
+            // Hardware/network waits never run on the display thread.
+            let sensor_handle = thread::spawn(move || {
+                let mut poller = poller::SensorPoller::new();
+                thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+                while !sensor_stop.load(Ordering::Relaxed) {
+                    let current = sensor_config.read().clone();
+                    poller.set_hardware_refresh_interval(Duration::from_secs(if hardware_automation_enabled(&current) { 1 } else { 2 }));
+                    let mut next = poller.read(current.libre_hardware_monitor_dll.as_deref(),
+                        current.cpu_temperature_source, current.cpu_clock_source,
+                        current.fan_sensor.as_deref(), current.disk_source.as_deref(), &current.weather);
+                    update_histories(&mut next, &sensor_latest.read(), 120);
+                    *sensor_latest.write() = next;
+                    let until = Instant::now() + Duration::from_millis(current.sensor_poll_ms.clamp(250, 60_000));
+                    while Instant::now() < until && !sensor_stop.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            });
+            let mut target = latest.read().clone();
+            let mut volume_reader = crate::sensors::windows_volume::Reader::new();
+            let mut live_volume = target.system_volume;
             let mut displayed = target.clone();
             let mut previous_frame: Option<RgbImage> = None;
-            let mut last_sensor_poll = Instant::now();
             let mut last_volume_poll = Instant::now() - Duration::from_millis(200);
             let mut applied_brightness = initial.display.brightness;
             let mut rendered_config: Option<AppConfig> = None;
             let mut rendered_dynamic_key = String::new();
             let mut rendered_visual_signature = 0;
+            let mut layer_cache = renderer::advanced_widgets::LayerCache::default();
             let mut observed_scene_revision = scene_revision.load(Ordering::Relaxed);
             let mut transition: Option<scene::Transition> = None;
             let mut rule_engine = scene::RuleEngine::new();
@@ -571,34 +631,24 @@ fn start_rendering_with_boot(state: &AppState, allow_boot_animation: bool) -> Re
             let mut active_rule_revision = observed_scene_revision;
             let mut manual_automation_override = false;
             while !thread_stop.load(Ordering::Relaxed) {
+                let cycle_started = Instant::now();
                 let mut current = config.read().clone();
-                sensor_poller.set_hardware_refresh_interval(if hardware_automation_enabled(&current)
-                {
-                    Duration::from_secs(1)
-                } else {
-                    Duration::from_secs(2)
-                });
+                target = latest.read().clone();
                 if volume_widget_enabled(&current)
                     && last_volume_poll.elapsed() >= Duration::from_millis(100)
                 {
-                    target.system_volume = sensor_poller.read_system_volume();
+                    live_volume = volume_reader.read();
                     last_volume_poll = Instant::now();
                 }
-                if last_sensor_poll.elapsed()
-                    >= Duration::from_millis(current.sensor_poll_ms.max(250))
-                {
-                    let mut next = sensor_poller.read(
-                        current.libre_hardware_monitor_dll.as_deref(),
-                        current.cpu_temperature_source,
-                        current.cpu_clock_source,
-                        current.fan_sensor.as_deref(),
-                        current.disk_source.as_deref(),
-                        &current.weather,
-                    );
-                    update_histories(&mut next, &target, 120);
-                    target = next;
-                    last_sensor_poll = Instant::now();
+                if volume_widget_enabled(&current) { target.system_volume = live_volume; }
+                if volume_widget_enabled(&current) {
+                    if let Some(info) = target.sensor_info.iter_mut().find(|info| info.key == "Volume") {
+                        info.value = live_volume;
+                        info.sampled_at_ms = Some(crate::sensors::model::timestamp_ms().saturating_sub(last_volume_poll.elapsed().as_millis() as u64));
+                    }
                 }
+                let stale_after_ms = current.sensor_poll_ms.saturating_mul(3).max(10_000);
+                for info in &mut target.sensor_info { info.stale_after_ms = info.stale_after_ms.max(stale_after_ms); }
                 if update_displayed_snapshot(&mut displayed, &target) {
                     *sensors.write() = displayed.clone();
                 }
@@ -677,17 +727,39 @@ fn start_rendering_with_boot(state: &AppState, allow_boot_animation: bool) -> Re
                     observed_scene_revision = revision;
                 }
                 let dynamic_key = renderer_dynamic_key(&current);
-                let visual_signature = renderer::visual_signature(&current, &displayed);
+                if connected_display.port != current.display.port
+                    || connected_display.orientation != current.display.orientation
+                    || connected_display.width != current.display.width
+                    || connected_display.height != current.display.height {
+                    session = None;
+                    previous_frame = None;
+                    connected_display = current.display.clone();
+                }
+                let live_texts = remote_texts.read().clone();
+                let visual_signature = renderer::visual_signature(&current, &displayed, &live_texts);
                 let should_render = previous_frame.is_none()
+                    || session.is_none()
                     || transition.is_some()
                     || rendered_config.as_ref() != Some(&current)
                     || rendered_dynamic_key != dynamic_key
+                    || layer_cache.refresh_due()
                     || rendered_visual_signature != visual_signature;
                 if !should_render {
-                    thread::sleep(renderer_sleep_interval(&current, transition.is_some()));
+                    diagnostics.write().skipped_frames += 1;
+                    let delay = if animation_interval(&current).is_some() || layer_cache.pending || volume_widget_enabled(&current) {
+                        renderer_sleep_interval(&current, false)
+                    } else { Duration::from_millis(250) };
+                    interruptible_sleep(&thread_stop, delay.saturating_sub(cycle_started.elapsed()));
                     continue;
                 }
-                let result = renderer::render(&current, &displayed).and_then(|target_image| {
+                let render_started = Instant::now();
+                let result = (|| -> anyhow::Result<RgbImage> {
+                    current.validate()?;
+                    let mut image = renderer::background::create(&current)?;
+                    renderer::advanced_widgets::draw_cached(&mut image, &current, &displayed, &live_texts, &mut layer_cache)?;
+                    Ok(image)
+                })().and_then(|target_image| {
+                    diagnostics.write().render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
                     if session.is_none() {
                         session = Some(display_driver::DisplaySession::connect(&current.display)?);
                         applied_brightness = current.display.brightness;
@@ -700,10 +772,11 @@ fn start_rendering_with_boot(state: &AppState, allow_boot_animation: bool) -> Re
                         applied_brightness = current.display.brightness;
                     }
                     if previous_frame.is_none()
-                        && allow_boot_animation
+                        && boot_pending
                         && current.effects.boot_animation_enabled
                     {
                         let duration = current.effects.boot_duration_ms.clamp(250, 5000);
+                        boot_pending = false;
                         let frame_count = (duration / 33).clamp(8, 90);
                         let boot_target = current
                             .effects
@@ -717,7 +790,7 @@ fn start_rendering_with_boot(state: &AppState, allow_boot_animation: bool) -> Re
                             })
                             .map(|loaded| merge_screen_settings(loaded, &current))
                             .as_ref()
-                            .and_then(|boot_config| renderer::render(boot_config, &displayed).ok())
+                            .and_then(|boot_config| renderer::render(boot_config, &displayed, &live_texts).ok())
                             .unwrap_or_else(|| target_image.clone());
                         for index in 0..frame_count {
                             if thread_stop.load(Ordering::Relaxed) {
@@ -759,13 +832,17 @@ fn start_rendering_with_boot(state: &AppState, allow_boot_animation: bool) -> Re
                         .as_ref()
                         .map(|animation| animation.frame(&target_image))
                         .unwrap_or((target_image, true));
+                    let transfer_started = Instant::now();
                     let send_result = send_changed_region(
                         session.as_mut().expect("session initialized"),
                         previous_frame.as_ref(),
                         &image,
                     );
+                    diagnostics.write().transfer_ms = transfer_started.elapsed().as_secs_f64() * 1000.0;
+                    if let Ok(bytes) = send_result.as_ref() { diagnostics.write().transmitted(*bytes); }
                     if send_result.is_err() {
                         session = None;
+                        previous_frame = None;
                     } else {
                         previous_frame = Some(image);
                         if transition_finished {
@@ -777,19 +854,23 @@ fn start_rendering_with_boot(state: &AppState, allow_boot_animation: bool) -> Re
                     }
                     send_result
                 });
+                let failed = result.is_err();
                 *status.write() = match result {
-                    Ok(()) => active_rule_screen
+                    Ok(_) => active_rule_screen
                         .as_deref()
                         .map(|screen| format!("Rendering active · Automatic screen: {screen}"))
                         .unwrap_or_else(|| "Rendering active".into()),
-                    Err(error) => format!("Error: {error:#}"),
+                    Err(error) => { diagnostics.write().errors += 1; format!("Error: {error:#}") },
                 };
-                thread::sleep(renderer_sleep_interval(&current, transition.is_some()));
+                let interval = if failed { Duration::from_secs(2) } else { renderer_sleep_interval(&current, transition.is_some()) };
+                interruptible_sleep(&thread_stop, interval.saturating_sub(cycle_started.elapsed()));
             }
+            drop(session);
+            let _ = sensor_handle.join();
             *status.write() = "Stopped".into();
         })
         .map_err(|e| e.to_string())?;
-    *worker = Some(RenderWorker { stop });
+    *worker = Some(RenderWorker { stop, handle });
     Ok(())
 }
 
@@ -835,6 +916,10 @@ fn update_displayed_snapshot(
     // Rendering extra interpolation frames for every value is expensive on
     // small USB displays and does not add useful visual information.
     let mut changed = assign(&mut current.cpu_temperature, target.cpu_temperature);
+    if current.sensor_info != target.sensor_info {
+        current.sensor_info.clone_from(&target.sensor_info);
+        changed = true;
+    }
     changed |= assign(
         &mut current.cpu_temperature_core,
         target.cpu_temperature_core,
@@ -905,6 +990,23 @@ fn update_displayed_snapshot(
     }
     current.fan_sensors.clone_from(&target.fan_sensors);
     current.disk_sensors.clone_from(&target.disk_sensors);
+    for (current, next) in [
+        (
+            &mut current.history_cpu_temperature,
+            &target.history_cpu_temperature,
+        ),
+        (&mut current.history_cpu_clock, &target.history_cpu_clock),
+        (
+            &mut current.history_gpu_temperature,
+            &target.history_gpu_temperature,
+        ),
+        (&mut current.history_gpu_clock, &target.history_gpu_clock),
+    ] {
+        if current != next {
+            current.clone_from(next);
+            changed = true;
+        }
+    }
     changed
 }
 
@@ -919,10 +1021,44 @@ fn volume_widget_enabled(config: &AppConfig) -> bool {
 fn renderer_sleep_interval(config: &AppConfig, transition_active: bool) -> Duration {
     if transition_active {
         Duration::from_millis(50)
+    } else if let Some(interval) = animation_interval(config) {
+        Duration::from_millis(config.frame_interval_ms.clamp(50, 1000).min(interval))
     } else if volume_widget_enabled(config) {
         Duration::from_millis(config.frame_interval_ms.clamp(50, 100))
     } else {
         Duration::from_millis(config.frame_interval_ms.clamp(50, 1000))
+    }
+}
+
+fn animation_interval(config: &AppConfig) -> Option<u64> {
+    use crate::config::schema::WidgetKind;
+    config
+        .widgets
+        .iter()
+        .filter(|widget| widget.enabled)
+        .filter_map(|widget| {
+            let fps = match widget.kind {
+                WidgetKind::Gif => widget.gif_fps as u64,
+                WidgetKind::SuperWidget => widget
+                    .superwidget_id
+                    .as_deref()
+                    .and_then(crate::superwidgets::find)
+                    .map_or(0, |manifest| manifest.animated_fps as u64),
+                _ => 0,
+            };
+            (fps > 0).then(|| (1000 / fps.clamp(1, 30)).max(50))
+        })
+        .min()
+}
+
+fn interruptible_sleep(stop: &AtomicBool, duration: Duration) {
+    let until = Instant::now() + duration;
+    while !stop.load(Ordering::Relaxed) && Instant::now() < until {
+        thread::sleep(
+            until
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+        );
     }
 }
 
@@ -977,6 +1113,18 @@ fn update_histories(
     }
     next.history_cpu = append(previous.history_cpu.clone(), next.cpu_usage, limit);
     next.history_gpu = append(previous.history_gpu.clone(), next.gpu_usage, limit);
+    next.history_cpu_temperature = append(
+        previous.history_cpu_temperature.clone(),
+        next.cpu_temperature,
+        limit,
+    );
+    next.history_cpu_clock = append(previous.history_cpu_clock.clone(), next.cpu_clock, limit);
+    next.history_gpu_temperature = append(
+        previous.history_gpu_temperature.clone(),
+        next.gpu_temperature,
+        limit,
+    );
+    next.history_gpu_clock = append(previous.history_gpu_clock.clone(), next.gpu_clock, limit);
     next.history_gpu_power = append(previous.history_gpu_power.clone(), next.gpu_power, limit);
     next.history_network_upload = append(
         previous.history_network_upload.clone(),
@@ -995,21 +1143,24 @@ fn send_changed_region(
     session: &mut display_driver::DisplaySession,
     previous: Option<&RgbImage>,
     current: &RgbImage,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     let Some(previous) = previous.filter(|image| image.dimensions() == current.dimensions()) else {
-        return session.send_region(current, 0, 0);
+        session.send_region(current, 0, 0)?;
+        return Ok(current.width() as u64 * current.height() as u64 * 2);
     };
     let regions = dirty_regions(previous, current);
     if regions.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
+    let mut bytes = 0;
     for region in regions {
         let image =
             image::imageops::crop_imm(current, region.x, region.y, region.width, region.height)
                 .to_image();
         session.send_region(&image, region.x as u16, region.y as u16)?;
+        bytes += region.width as u64 * region.height as u64 * 2;
     }
-    Ok(())
+    Ok(bytes)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1108,8 +1259,9 @@ pub fn stop_rendering(state: State<AppState>) {
 }
 
 pub fn stop_rendering_state(state: &AppState) {
-    if let Some(worker) = state.worker.lock().take() {
+    if let Some(worker) = state.worker.lock().as_ref() {
         worker.stop.store(true, Ordering::Relaxed);
+        *state.status.write() = "Stopping rendering".into();
     }
 }
 
@@ -1120,8 +1272,13 @@ pub fn get_status(state: State<AppState>) -> Status {
 
 pub fn get_status_state(state: &AppState) -> Status {
     Status {
-        running: state.worker.lock().is_some(),
+        running: state.worker.lock().as_ref().is_some_and(|worker| {
+            !worker.stop.load(Ordering::Relaxed) && !worker.handle.is_finished()
+        }),
         message: state.status.read().clone(),
+        diagnostics: state.diagnostics.read().snapshot(),
+        sensor_info: state.sensors.read().sensor_info.clone(),
+        server_time_ms: crate::sensors::model::timestamp_ms(),
     }
 }
 
@@ -1138,6 +1295,47 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animation_pacing_is_independent_of_slow_sensor_frame_setting() {
+        use crate::config::schema::{WidgetConfig, WidgetKind};
+        let mut config = AppConfig::default();
+        config.frame_interval_ms = 1000;
+        config.widgets = vec![WidgetConfig::new(WidgetKind::Gif, 0, 0, "")];
+        config.widgets[0].gif_fps = 20;
+        assert_eq!(
+            renderer_sleep_interval(&config, false),
+            Duration::from_millis(50)
+        );
+        config.widgets[0].enabled = false;
+        assert_eq!(
+            renderer_sleep_interval(&config, false),
+            Duration::from_millis(1000)
+        );
+    }
+
+    #[test]
+    fn graph_histories_keep_temperature_clock_and_usage_separate() {
+        use crate::{config::schema::WidgetKind, sensors::model::SensorSnapshot};
+        let mut next = SensorSnapshot {
+            cpu_usage: Some(12.0),
+            cpu_temperature: Some(67.0),
+            cpu_clock: Some(4800.0),
+            gpu_usage: Some(45.0),
+            gpu_temperature: Some(70.0),
+            gpu_clock: Some(2500.0),
+            ..Default::default()
+        };
+        update_histories(&mut next, &SensorSnapshot::default(), 120);
+        assert_eq!(next.history(WidgetKind::CpuTemperature), &[67.0]);
+        assert_eq!(next.history(WidgetKind::CpuClock), &[4800.0]);
+        assert_eq!(next.history(WidgetKind::CpuUsage), &[12.0]);
+        assert_eq!(next.history(WidgetKind::GpuTemperature), &[70.0]);
+        assert_eq!(next.history(WidgetKind::GpuClock), &[2500.0]);
+        let mut displayed = SensorSnapshot::default();
+        update_displayed_snapshot(&mut displayed, &next);
+        assert_eq!(displayed.history(WidgetKind::GpuClock), &[2500.0]);
+    }
     use image::Rgb;
 
     #[test]

@@ -3,6 +3,50 @@
 This document tracks the most important user-facing and architectural changes
 made to TelemetryForge.
 
+## Main updates — 2026-09-29
+
+- Added live diagnostics: actual display-update FPS over five seconds, render/
+  transfer timing, RGB565 payload totals, skipped frames and error counters.
+- Deferred pending layer recomposition until its refresh deadline, paced animated
+  widgets independently, subtracted work time from frame waits, and backed off
+  connection errors with interruptible waits.
+- Added optional 4/8/16 px editor grids, magnetic edge/centre guides, Alt bypass,
+  1 px arrow nudges and Shift+arrow 10 px nudges, respecting groups and locks.
+  Dragging pauses preview replacement; group resizing retains pointer capture.
+- Added cached sensor provenance, source-sampling timestamps, unavailable/stale
+  status and source errors. Weather setting changes invalidate cached conditions.
+  Missing numeric indicators show `--` instead of looking like a valid zero.
+- Created a local `telemetry` screen cloned from `test`, with cyan/amber CPU/GPU
+  dials, compact histories and a resource strip; the original screen is unchanged.
+  The manual authoring recipe lives in `src/screen_design.rs` (ignored tests).
+- Published a portable Telemetry sample with a neutral TF background, editable
+  widgets and no personal artwork, paths, credentials or automation settings.
+- Validated Super Widget IDs and entry paths; packages are extracted with file/size
+  limits into staging directories and installed only after validation.
+- Cached the Super Widget registry; rendering no longer reinstalls bundled files.
+- Shared decoded GIF frames instead of cloning animations on every frame; bounded
+  GIF decoding and cache memory.
+- Cached individual widget layers, including transparency, glow and shadows;
+  widget refresh intervals now control live sensor redraws independently of animation FPS.
+- Moved hardware/weather polling off the display thread and added bridge read timeouts.
+- Separated CPU/GPU temperature, clock and utilisation graph histories.
+- Fixed remote text updates triggering scene transitions and automation overrides.
+  Identical updates are no-ops; text length and key count are bounded.
+- Added revocable, hashed Bearer tokens scoped to the text endpoint. Remote Deck
+  is disabled by default for new configurations; existing settings are preserved.
+- Moved blocking HTTP commands/password verification off async workers; cached
+  successful authentication briefly. Server status reflects the actual listener.
+- Added atomic configuration saves, previous-version backups and recovery.
+- Unified draft preview requests and discarded stale responses during editing.
+- Applied background alpha and sensor bindings to WASM Super Widgets too.
+- Export packages now include slideshow files, Super Widget modules and explicitly
+  selected custom font files; authentication credentials are stripped.
+- Added host-side drawing budgets to WASM, configuration bounds and import limits.
+- Reconnect on display port/orientation/resolution changes, resend a full frame
+  after transmission failure and prevent overlapping render workers on Stop/Start.
+- Added regression tests for HTTP authentication/scope, duplicate POSTs, imports,
+  backups, graph histories and cached overlapping widget layers.
+
 ## 0.3.0 — 2026-06-24
 
 ### Remote Deck LAN

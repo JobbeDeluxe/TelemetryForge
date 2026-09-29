@@ -27,9 +27,10 @@ pub fn create(config: &AppConfig) -> Result<RgbImage> {
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     let cache_key = format!(
-        "{}:{width}:{height}:{:?}:{modified}",
+        "{}:{width}:{height}:{:?}:{modified}:{}",
         path.display(),
-        config.background.mode
+        config.background.mode,
+        config.background.colour
     );
     if let Some((_, image)) = BACKGROUND_CACHE
         .lock()
@@ -65,9 +66,9 @@ pub fn create(config: &AppConfig) -> Result<RgbImage> {
             canvas = imageops::crop_imm(&resized, x, y, width, height).to_image();
         }
         BackgroundMode::Centre => {
-            let x = width.saturating_sub(source.width()) / 2;
-            let y = height.saturating_sub(source.height()) / 2;
-            imageops::overlay(&mut canvas, &source, x as i64, y as i64);
+            let x = (width as i64 - source.width() as i64) / 2;
+            let y = (height as i64 - source.height() as i64) / 2;
+            imageops::overlay(&mut canvas, &source, x, y);
         }
     }
     *BACKGROUND_CACHE.lock().expect("background cache poisoned") =
@@ -113,7 +114,7 @@ fn is_supported_image(path: &Path) -> bool {
         .is_some_and(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "bmp" | "gif" | "webp"
+                "png" | "jpg" | "jpeg" | "bmp" | "gif"
             )
         })
 }

@@ -1,5 +1,23 @@
 use serde::{Deserialize, Serialize};
 
+pub fn timestamp_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct SensorInfo {
+    pub key: String,
+    pub source: String,
+    pub value: Option<f32>,
+    pub unit: String,
+    pub sampled_at_ms: Option<u64>,
+    pub stale_after_ms: u64,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct NamedSensor {
     pub id: String,
@@ -10,6 +28,7 @@ pub struct NamedSensor {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SensorSnapshot {
+    pub sensor_info: Vec<SensorInfo>,
     pub cpu_temperature: Option<f32>,
     pub cpu_temperature_core: Option<f32>,
     pub cpu_temperature_socket: Option<f32>,
@@ -39,8 +58,31 @@ pub struct SensorSnapshot {
     pub disk_sensors: Vec<NamedSensor>,
     pub history_cpu: Vec<f32>,
     pub history_gpu: Vec<f32>,
+    pub history_cpu_temperature: Vec<f32>,
+    pub history_cpu_clock: Vec<f32>,
+    pub history_gpu_temperature: Vec<f32>,
+    pub history_gpu_clock: Vec<f32>,
     pub history_gpu_power: Vec<f32>,
     pub history_network_download: Vec<f32>,
     pub history_network_upload: Vec<f32>,
     pub history_volume: Vec<f32>,
+}
+
+impl SensorSnapshot {
+    pub fn history(&self, kind: crate::config::schema::WidgetKind) -> &[f32] {
+        use crate::config::schema::WidgetKind::*;
+        match kind {
+            CpuUsage => &self.history_cpu,
+            CpuTemperature => &self.history_cpu_temperature,
+            CpuClock => &self.history_cpu_clock,
+            GpuUsage => &self.history_gpu,
+            GpuTemperature => &self.history_gpu_temperature,
+            GpuClock => &self.history_gpu_clock,
+            GpuPower => &self.history_gpu_power,
+            NetworkUpload => &self.history_network_upload,
+            NetworkDownload => &self.history_network_download,
+            Volume => &self.history_volume,
+            _ => &[],
+        }
+    }
 }

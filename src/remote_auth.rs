@@ -23,6 +23,49 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     })
 }
 
+/// Cache successful credentials briefly so preview polling does not run
+/// Argon2 for every frame. Hash changes/revocation invalidate old entries.
+pub async fn verify_request(password: String, hash: String) -> bool {
+    use std::{
+        sync::{Arc, LazyLock, Mutex},
+        time::{Duration, Instant},
+    };
+    static VERIFIED: LazyLock<Mutex<Vec<(String, String, Instant)>>> =
+        LazyLock::new(|| Mutex::new(Vec::new()));
+    static SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+        LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
+    if password.len() > 1024 || hash.is_empty() {
+        return false;
+    }
+    {
+        let mut entries = VERIFIED.lock().expect("auth cache poisoned");
+        entries.retain(|entry| entry.2.elapsed() < Duration::from_secs(30));
+        if entries
+            .iter()
+            .any(|entry| entry.0 == password && entry.1 == hash)
+        {
+            return true;
+        }
+    }
+    let Ok(permit) = SLOTS.clone().try_acquire_owned() else {
+        return false;
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if !verify_password(&password, &hash) {
+            return false;
+        }
+        let mut entries = VERIFIED.lock().expect("auth cache poisoned");
+        if entries.len() >= 32 {
+            entries.remove(0);
+        }
+        entries.push((password, hash, Instant::now()));
+        true
+    })
+    .await
+    .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

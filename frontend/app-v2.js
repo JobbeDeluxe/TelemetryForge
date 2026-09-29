@@ -15,6 +15,8 @@ let previewInteractionActive = false;
 let previewRefreshPending = false;
 let autostartEnabled = false;
 let gifPreviewBusy = false;
+let previewRequestBusy = false;
+let previewRevision = 0;
 let availableScreens = [];
 let availableSuperWidgets = [];
 let availableFanSensors = [];
@@ -135,7 +137,7 @@ const nameKeys = {
   cpu_temperature:"widgetCpuTemp",cpu_usage:"widgetCpuUsage",cpu_clock:"widgetCpuClock",gpu_temperature:"widgetGpuTemp",
   gpu_usage:"widgetGpuUsage",gpu_clock:"widgetGpuClock",gpu_power:"widgetGpuPower",ram_usage:"widgetRam",vram_usage:"widgetVram",
   disk_usage:"widgetDisk",network_upload:"widgetUpload",network_download:"widgetDownload",
-  fan_speed:"widgetFan",clock:"widgetClock",date:"widgetDate",fps:"widgetFps",text:"widgetText",gif:"widgetGif",
+  fan_speed:"widgetFan",clock:"widgetClock",date:"widgetDate",fps:"widgetFps",text:"widgetText",remote_text:"widgetRemoteText",gif:"widgetGif",
   volume:"widgetVolume",weather_temperature:"widgetWeatherTemperature",weather_humidity:"widgetWeatherHumidity",
   weather_wind:"widgetWeatherWind",weather_condition:"widgetWeatherCondition",weather_icon:"widgetWeatherIcon",
   super_widget:"widgetSuperWidget"
@@ -147,7 +149,7 @@ const defaults = {
   gpu_clock: "{value}", gpu_power: "{value}", ram_usage: "{value}", vram_usage: "{value}",
   disk_usage: "{value}", network_upload: "{value}", network_download: "{value}",
   fan_speed: "{value}", clock: "{value}", date: "{value}", fps: "{value}",
-  text: "Testo libero", gif: "", volume: "{value}", weather_temperature:"{value}",
+  text: "Testo libero", remote_text: "{value}", gif: "", volume: "{value}", weather_temperature:"{value}",
   weather_humidity:"{value}",weather_wind:"{value}",weather_condition:"{value}",super_widget: ""
   ,weather_icon:"{value}"
 };
@@ -560,12 +562,13 @@ function renderWidgets() {
         <label class="wide">${t("textFormat")}<input data-i="${i}" data-k="label_format" value="${esc(w.label_format)}" placeholder="GPU {value} MHz"></label>
         <label>${t("leftText")}<input data-i="${i}" data-k="left_text" value="${esc(w.left_text || "")}" placeholder="GPU "></label>
         <label>${t("rightText")}<input data-i="${i}" data-k="right_text" value="${esc(w.right_text || "")}" placeholder=" °C"></label>
+        ${w.kind === "remote_text" ? `<label class="wide">${t("remoteTextKey")}<input data-i="${i}" data-k="remote_text_key" value="${esc(w.remote_text_key || "status")}" placeholder="game-status"></label><small class="wide hint">${t("remoteTextHint")}</small>` : ""}
         `}
         <label>X<input data-i="${i}" data-k="x" type="number" value="${w.x}"></label>
         <label>Y<input data-i="${i}" data-k="y" type="number" value="${w.y}"></label>
         <label>${t("width")}<input data-i="${i}" data-k="width" type="number" min="1" value="${w.width}"></label>
         <label>${t("height")}<input data-i="${i}" data-k="height" type="number" min="1" value="${w.height}"></label>
-        ${w.kind === "super_widget" ? "" : `<label>${t("font")}<select data-i="${i}" data-k="font">${fonts.map(font => `<option value="${font}" ${(w.font || "Segoe UI") === font ? "selected" : ""}>${font}</option>`).join("")}</select></label>`}
+        ${w.kind === "super_widget" ? "" : `<label>${t("font")}<select data-i="${i}" data-k="font">${[...new Set([...fonts, w.font || "Segoe UI"])].map(font => `<option value="${esc(font)}" ${(w.font || "Segoe UI") === font ? "selected" : ""}>${esc(font)}</option>`).join("")}</select></label>`}
         <label>${t("fontSize")}<input data-i="${i}" data-k="font_size" type="number" min="6" value="${w.font_size}"></label>
         <label>${t("interval")}<input data-i="${i}" data-k="refresh_interval_ms" type="number" min="100" value="${w.refresh_interval_ms}"></label>
         ${w.kind === "gif" ? `
@@ -636,7 +639,11 @@ function renderWidgets() {
       if (["editor_name","enabled","locked"].includes(input.dataset.k)) renderLayers();
       renderOverlay();
       scheduleLivePreview();
-      if (input.dataset.k === "render_mode") renderWidgets();
+      if (input.dataset.k === "kind" && config.widgets[+input.dataset.i].kind === "remote_text") {
+        config.widgets[+input.dataset.i].render_mode = "text";
+        config.widgets[+input.dataset.i].label_format = "{value}";
+      }
+      if (["render_mode", "kind"].includes(input.dataset.k)) renderWidgets();
     };
     input.oninput = update;
     input.onchange = update;
@@ -758,34 +765,20 @@ function readWidgetInput(input) {
 }
 
 function scheduleLivePreview() {
+  previewRevision++;
   clearTimeout(previewTimer);
-  previewTimer = setTimeout(async () => {
-    if (previewInteractionActive) {
-      previewRefreshPending = true;
-      return;
-    }
-    try {
-      const preview = await invoke("preview_config", {config});
-      if (previewInteractionActive) {
-        previewRefreshPending = true;
-        return;
-      }
-      $("preview").src = preview;
-      $("error").textContent = "";
-    } catch (error) {
-      $("error").textContent = `${t("previewError")}: ${error}`;
-    }
-  }, 160);
+  previewTimer = setTimeout(refreshPreview, 160);
 }
 
 async function refreshGifPreview() {
   if (gifPreviewBusy || previewInteractionActive || document.hidden || !config) return;
   const animated = config.widgets.some(widget =>
-    widget.enabled && widget.kind === "gif" && widget.gif_path);
+    widget.enabled && ((widget.kind === "gif" && widget.gif_path) ||
+      (widget.kind === "super_widget" && availableSuperWidgets.some(item => item.id === widget.superwidget_id && item.animated_fps > 0))));
   if (!animated) return;
   gifPreviewBusy = true;
   try {
-    $("preview").src = await invoke("preview_config", {config});
+    await refreshPreview();
   } catch (error) {
     $("error").textContent = `${t("previewError")}: ${error}`;
   } finally {
@@ -804,6 +797,9 @@ function renderOverlay() {
     showObjectMenu(event.clientX, event.clientY);
   };
   const sx = layer.clientWidth / config.display.width, sy = layer.clientHeight / config.display.height;
+  const grid=+$("snap-grid").value;
+  $("alignment-guides").style.backgroundImage=grid?"linear-gradient(to right, #65d8cc22 1px, transparent 1px), linear-gradient(to bottom, #65d8cc22 1px, transparent 1px)":"none";
+  $("alignment-guides").style.backgroundSize=`${grid*sx}px ${grid*sy}px`;
   config.widgets.forEach((w, i) => {
     if (!w.enabled) return;
     const el = document.createElement("div");
@@ -967,12 +963,64 @@ async function applyLayout(action) {
   await refreshPreview();
 }
 
+// Pure geometry, shared by drag/resize and covered by the editor regression test.
+function snapAxis(position, size, targets, grid, tolerance) {
+  let best = tolerance, guide = null, snapped = position;
+  for (const anchor of [position, position + size/2, position + size]) {
+    for (const target of targets) {
+      const distance = Math.abs(target-anchor);
+      if (distance <= best) { best=distance; snapped=position+target-anchor; guide=target; }
+    }
+  }
+  return {position: guide == null && grid > 0 ? Math.round(position/grid)*grid : snapped, guide};
+}
+
+function snapTargets(excluded, axis) {
+  const size=axis==="x" ? "width" : "height";
+  const targets=[0,config.display[size]/2,config.display[size]];
+  config.widgets.forEach((widget,index)=>{
+    if(widget.enabled && !excluded.includes(index)) targets.push(widget[axis],widget[axis]+widget[size]/2,widget[axis]+widget[size]);
+  });
+  return targets;
+}
+
+function showAlignmentGuides(x=null,y=null) {
+  const layer=$("alignment-guides");
+  layer.replaceChildren();
+  for(const [axis,value,size] of [["vertical",x,"width"],["horizontal",y,"height"]]) {
+    if(value==null) continue;
+    const line=document.createElement("div");
+    line.className=`alignment-guide ${axis}`;
+    line.style[axis==="vertical"?"left":"top"]=`${100*value/config.display[size]}%`;
+    layer.appendChild(line);
+  }
+}
+
+function snappedGeometry(x,y,width,height,excluded,event,rect) {
+  if(event.altKey) {showAlignmentGuides();return {x,y};}
+  const grid=+$("snap-grid").value, guides=$("snap-guides").checked;
+  const sx=snapAxis(x,width,guides?snapTargets(excluded,"x"):[],grid,6*config.display.width/rect.width);
+  const sy=snapAxis(y,height,guides?snapTargets(excluded,"y"):[],grid,6*config.display.height/rect.height);
+  showAlignmentGuides(sx.guide,sy.guide);
+  return {x:sx.position,y:sy.position};
+}
+
+function movableSelection() {
+  const indexes = new Set(selectedWidgets);
+  if(selectedWidget>=0) indexes.add(selectedWidget);
+  const groups=new Set([...indexes].map(i=>config.widgets[i]?.group_id).filter(Boolean));
+  config.widgets.forEach((widget,index)=>{if(groups.has(widget.group_id))indexes.add(index);});
+  return [...indexes].filter(i=>config.widgets[i]&&!config.widgets[i].locked);
+}
+
 function startResize(e, index, el) {
   e.preventDefault();
   e.stopPropagation();
   const w = config.widgets[index];
   if (w.locked) return;
+  document.activeElement?.blur();
   previewInteractionActive = true;
+  previewRevision++;
   recordUndo();
   const rect = $("widget-overlay").getBoundingClientRect();
   const startX = e.clientX, startY = e.clientY, startWidth = w.width, startHeight = w.height;
@@ -990,8 +1038,10 @@ function startResize(e, index, el) {
   updateOverlayStacking();
   el.setPointerCapture(e.pointerId);
   el.onpointermove = m => {
-    const dx = (m.clientX-startX)*config.display.width/rect.width;
-    const dy = (m.clientY-startY)*config.display.height/rect.height;
+    const edge=snappedGeometry(maxX+(m.clientX-startX)*config.display.width/rect.width,
+      maxY+(m.clientY-startY)*config.display.height/rect.height,0,0,groupIndexes,m,rect);
+    const dx = edge.x-maxX;
+    const dy = edge.y-maxY;
     if(groupItems.length>1){
       const maxScaleX=Math.max(.1,(config.display.width-minX)/groupWidth);
       const maxScaleY=Math.max(.1,(config.display.height-minY)/groupHeight);
@@ -1003,8 +1053,12 @@ function startResize(e, index, el) {
         target.y=Math.round(minY+(item.y-minY)*scaleY);
         target.width=Math.max(8,Math.round(item.width*scaleX));
         target.height=Math.max(8,Math.round(item.height*scaleY));
+        const handle=$("widget-overlay").querySelector(`[data-index="${item.index}"]`);
+        if(handle) Object.assign(handle.style,{
+          left:`${target.x*rect.width/config.display.width}px`,top:`${target.y*rect.height/config.display.height}px`,
+          width:`${target.width*rect.width/config.display.width}px`,height:`${target.height*rect.height/config.display.height}px`
+        });
       });
-      renderOverlay();
     }else{
       w.width = Math.round(Math.max(8, Math.min(config.display.width-w.x, startWidth+dx)));
       w.height = Math.round(Math.max(8, Math.min(config.display.height-w.y, startHeight+dy)));
@@ -1014,6 +1068,7 @@ function startResize(e, index, el) {
   };
   const end = async () => {
     el.onpointermove = el.onpointerup = el.onpointercancel = null;
+    showAlignmentGuides();
     previewInteractionActive = false;
     renderWidgets();
     renderLayers();
@@ -1027,6 +1082,10 @@ function startResize(e, index, el) {
 function startDrag(e) {
   e.preventDefault();
   const el = e.currentTarget, i = +el.dataset.index, w = config.widgets[i];
+  if(w.locked) return;
+  document.activeElement?.blur();
+  previewInteractionActive = true;
+  previewRevision++;
   const rect = $("widget-overlay").getBoundingClientRect();
   const sx = e.clientX, sy = e.clientY, ox = w.x, oy = w.y;
   selectedWidget = i;
@@ -1047,8 +1106,10 @@ function startDrag(e) {
   const maxY=Math.max(...moving.map(item=>item.y+config.widgets[item.index].height));
   el.setPointerCapture(e.pointerId);
   el.onpointermove = m => {
-    const requestedDx=(m.clientX-sx)*config.display.width/rect.width;
-    const requestedDy=(m.clientY-sy)*config.display.height/rect.height;
+    const snapped=snappedGeometry(minX+(m.clientX-sx)*config.display.width/rect.width,
+      minY+(m.clientY-sy)*config.display.height/rect.height,maxX-minX,maxY-minY,movingIndexes,m,rect);
+    const requestedDx=snapped.x-minX;
+    const requestedDy=snapped.y-minY;
     const dx=Math.max(-minX,Math.min(config.display.width-maxX,requestedDx));
     const dy=Math.max(-minY,Math.min(config.display.height-maxY,requestedDy));
     moving.forEach(item => {
@@ -1061,6 +1122,8 @@ function startDrag(e) {
   };
   const end = async () => {
     el.onpointermove = el.onpointerup = el.onpointercancel = null;
+    previewInteractionActive = false;
+    showAlignmentGuides();
     renderWidgets(); renderLayers(); await invoke("save_config", {config}); await refreshPreview();
   };
   el.onpointerup = el.onpointercancel = end;
@@ -1109,14 +1172,18 @@ async function save() {
   bindConfig(); await refreshPreview(); $("status").textContent = t("configurationSaved");
 }
 async function refreshPreview() {
-  if (previewInteractionActive) {
+  if (!config) return;
+  if (previewInteractionActive || previewRequestBusy) {
     previewRefreshPending = true;
     return;
   }
+  previewRequestBusy = true;
+  previewRefreshPending = false;
+  const revision = previewRevision;
   try {
     $("error").textContent="";
-    const preview = await invoke("get_preview");
-    if (previewInteractionActive) {
+    const preview = await invoke("preview_config", {config: JSON.parse(JSON.stringify(config))});
+    if (previewInteractionActive || revision !== previewRevision) {
       previewRefreshPending = true;
       return;
     }
@@ -1124,14 +1191,38 @@ async function refreshPreview() {
     previewRefreshPending = false;
     requestAnimationFrame(renderOverlay);
   }
-  catch(e) { $("error").textContent=String(e); }
+  catch(e) { if (revision === previewRevision) $("error").textContent=String(e); }
+  finally {
+    previewRequestBusy = false;
+    if (previewRefreshPending && !previewInteractionActive) {
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(refreshPreview, 100);
+    }
+  }
 }
+function sensorHealth(info, now) {
+  const age=info.sampled_at_ms==null?null:Math.max(0,now-info.sampled_at_ms);
+  const state=info.value==null?"unavailable":info.error || age==null || age>info.stale_after_ms?"stale":"available";
+  return {age,state};
+}
+
 async function refreshStatus() {
   const s=await invoke("get_status");
   renderingActive = s.running;
   if (!renderingBusy) updateRenderButton();
   const known={"Stopped":"statusStopped","Rendering active":"statusActive","Frame sent":"statusFrameSent"};
   $("status").textContent=known[s.message]?t(known[s.message]):s.message;
+  if (s.diagnostics) {
+    const d=s.diagnostics;
+    $("diagnostics-values").textContent = `${d.fps.toFixed(1)} FPS · Render ${d.render_ms.toFixed(1)} ms · USB + diff ${d.transfer_ms.toFixed(1)} ms · ${t("diagSent")}: ${d.transmitted_frames} · ${t("diagSkipped")}: ${d.skipped_frames} · ${(d.transferred_bytes/1048576).toFixed(2)} MiB · ${t("diagErrors")}: ${d.errors}`;
+  }
+  if ($("diagnostics-panel").open) {
+    $("sensor-health-values").innerHTML=(s.sensor_info || []).map(info=>{
+      const {age,state}=sensorHealth(info,s.server_time_ms ?? Date.now());
+      const label=!s.running?t("sensorStopped"):t(state==="available"?"sensorAvailable":state==="stale"?"sensorStale":"sensorMissing");
+      return `<tr><td>${esc(info.key)}</td><td>${info.value==null?"—":esc(Number(info.value.toFixed(2))+" "+info.unit)}</td><td>${esc(info.source)}</td><td>${age==null?"—":(age/1000).toFixed(1)+" s"}</td><td class="${state}" title="${esc(info.error || "")}">${esc(label)}${info.error?`<br>${esc(info.error)}`:""}</td></tr>`;
+    }).join("");
+  }
   if(s.running && !document.hidden) refreshPreview();
 }
 
@@ -1209,10 +1300,14 @@ async function saveRemoteSecurity(){
       enabled:$("remote-enabled").checked,
       authentication_enabled:$("remote-auth-enabled").checked,
       username:$("remote-username").value.trim(),
-      password:$("remote-password").value
+      password:$("remote-password").value,
+      text_token:$("remote-text-token").value,
+      clear_text_token:$("remote-clear-token").checked
     };
     const updated=await invoke("set_remote_security",{settings});
     $("remote-password").value="";
+    $("remote-text-token").value="";
+    $("remote-clear-token").checked=false;
     applyRemoteInfo(updated);
     $("remote-security-status").textContent=t("remoteSecuritySaved");
     $("error").textContent="";
@@ -1253,7 +1348,7 @@ $("add-widget").onclick=()=>{
     config.widgets.push({editor_name:`${item.name} ${config.widgets.filter(w=>w.superwidget_id===item.id).length+1}`,locked:false,group_id:null,kind:"super_widget",superwidget_id:item.id,superwidget_background_colour:"#000000",superwidget_background_opacity:0,superwidget_bindings:{},render_mode:"text",enabled:true,left_text:"",right_text:"",x:20,y:20,width:item.width,height:item.height,font:"Bahnschrift",font_size:24,colour:"#ffffff",secondary_colour:"#1f99ff",opacity:1,graph_background_colour:"#000000",graph_background_opacity:0,gif_path:null,gif_fps:8,gif_loop:true,gif_fit:"contain",glow:0,shadow:0,use_thresholds:false,warning_threshold:70,critical_threshold:90,warning_colour:"#ffd166",critical_colour:"#ff4d6d",circle_thickness:16,circle_start_angle:-90,circle_sweep_angle:360,refresh_interval_ms:500,label_format:""});
   }else{
     const kind=selection;const affix=defaultAffixes[kind]||{left:"",right:""};
-    config.widgets.push({editor_name:`${widgetName(kind)} ${config.widgets.filter(w=>w.kind===kind).length+1}`,locked:false,group_id:null,kind,superwidget_id:null,superwidget_background_colour:"#000000",superwidget_background_opacity:0,superwidget_bindings:{},render_mode:"text",enabled:true,left_text:affix.left,right_text:affix.right,x:20,y:20,width:kind==="gif"?96:kind==="weather_icon"?72:180,height:kind==="gif"?96:kind==="weather_icon"?72:42,font:kind==="weather_icon"?"Segoe UI Symbol":"Segoe UI",font_size:kind==="weather_icon"?56:24,colour:config.theme.foreground,secondary_colour:config.theme.accent,opacity:1,graph_background_colour:"#000000",graph_background_opacity:0,gif_path:null,gif_fps:8,gif_loop:true,gif_fit:"contain",glow:0,shadow:0,use_thresholds:false,warning_threshold:70,critical_threshold:90,warning_colour:"#ffd166",critical_colour:"#ff4d6d",circle_thickness:16,circle_start_angle:-90,circle_sweep_angle:360,refresh_interval_ms:1000,label_format:defaults[kind]});
+    config.widgets.push({editor_name:`${widgetName(kind)} ${config.widgets.filter(w=>w.kind===kind).length+1}`,locked:false,group_id:null,kind,remote_text_key:"status",superwidget_id:null,superwidget_background_colour:"#000000",superwidget_background_opacity:0,superwidget_bindings:{},render_mode:"text",enabled:true,left_text:affix.left,right_text:affix.right,x:20,y:20,width:kind==="gif"?96:kind==="weather_icon"?72:180,height:kind==="gif"?96:kind==="weather_icon"?72:42,font:kind==="weather_icon"?"Segoe UI Symbol":"Segoe UI",font_size:kind==="weather_icon"?56:24,colour:config.theme.foreground,secondary_colour:config.theme.accent,opacity:1,graph_background_colour:"#000000",graph_background_opacity:0,gif_path:null,gif_fps:8,gif_loop:true,gif_fit:"contain",glow:0,shadow:0,use_thresholds:false,warning_threshold:70,critical_threshold:90,warning_colour:"#ffd166",critical_colour:"#ff4d6d",circle_thickness:16,circle_start_angle:-90,circle_sweep_angle:360,refresh_interval_ms:1000,label_format:defaults[kind]});
   }
   selectedWidget=config.widgets.length-1;selectedWidgets=new Set([selectedWidget]);collapsedWidgets.delete(selectedWidget);renderWidgets();renderLayers();renderOverlay();scheduleLivePreview();
 };
@@ -1311,7 +1406,21 @@ $("send-once").onclick=async()=>{try{await save();await invoke("render_once");}c
 window.addEventListener("resize",renderOverlay);
 window.addEventListener("keydown", event => {
   if (event.key === "Escape" && previewFullscreen) setPreviewFullscreen(false);
-  const editing = ["INPUT","TEXTAREA","SELECT"].includes(document.activeElement?.tagName);
+  const editing = ["INPUT","TEXTAREA","SELECT"].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable;
+  if (!editing && !previewInteractionActive && !event.ctrlKey && !event.metaKey && config && ["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"].includes(event.key)) {
+    const indexes=movableSelection();
+    if(indexes.length) {
+      event.preventDefault();
+      if(!event.repeat) recordUndo();
+      const widgets=indexes.map(i=>config.widgets[i]), step=event.shiftKey?10:1;
+      const requestedX=event.key==="ArrowRight"?step:event.key==="ArrowLeft"?-step:0;
+      const requestedY=event.key==="ArrowDown"?step:event.key==="ArrowUp"?-step:0;
+      const dx=Math.max(-Math.min(...widgets.map(w=>w.x)),Math.min(config.display.width-Math.max(...widgets.map(w=>w.x+w.width)),requestedX));
+      const dy=Math.max(-Math.min(...widgets.map(w=>w.y)),Math.min(config.display.height-Math.max(...widgets.map(w=>w.y+w.height)),requestedY));
+      widgets.forEach(w=>{w.x+=dx;w.y+=dy;});
+      renderOverlay();scheduleLivePreview();
+    }
+  }
   if ((event.ctrlKey || event.metaKey) && !editing && event.key.toLowerCase()==="z") {
     event.preventDefault();
     event.shiftKey ? redo() : undo();
@@ -1326,6 +1435,15 @@ window.addEventListener("keydown", event => {
     if(name){recordUndo();widget.editor_name=name;renderWidgets();renderLayers();renderOverlay();scheduleLivePreview();persistEditorChange();}
   }
 });
+window.addEventListener("keyup", event=>{
+  if(event.key.startsWith("Arrow") && !["INPUT","TEXTAREA","SELECT"].includes(document.activeElement?.tagName) && !document.activeElement?.isContentEditable && config && movableSelection().length) {
+    renderWidgets();renderLayers();persistEditorChange();
+  }
+});
+$("snap-grid").value=localStorage.getItem("telemetryforge-snap-grid") || "0";
+$("snap-guides").checked=localStorage.getItem("telemetryforge-snap-guides") !== "false";
+$("snap-grid").onchange=()=>{localStorage.setItem("telemetryforge-snap-grid",$("snap-grid").value);renderOverlay();};
+$("snap-guides").onchange=()=>localStorage.setItem("telemetryforge-snap-guides",String($("snap-guides").checked));
 document.addEventListener("pointerdown", event => {
   if (!event.target.closest("#object-menu")) hideObjectMenu();
 });

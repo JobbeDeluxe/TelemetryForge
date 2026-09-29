@@ -15,7 +15,7 @@ use wasmi::{Caller, Config, Engine, Linker, Module, Store, StoreLimits, StoreLim
 
 #[derive(Clone)]
 struct CachedModule {
-    modified: u64,
+    modified: u128,
     engine: Engine,
     module: Module,
 }
@@ -28,6 +28,7 @@ struct HostState {
     image: RgbaImage,
     sensors: SensorSnapshot,
     limits: StoreLimits,
+    draw_budget: u64,
 }
 
 pub fn render(
@@ -44,6 +45,7 @@ pub fn render(
         HostState {
             image: RgbaImage::new(width.max(1), height.max(1)),
             sensors: sensors.clone(),
+            draw_budget: 8_000_000,
             limits: StoreLimitsBuilder::new()
                 .memory_size(8 * 1024 * 1024)
                 .table_elements(1024)
@@ -66,7 +68,7 @@ fn cached_module(path: &Path) -> Result<CachedModule> {
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
+        .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     if let Some(cached) = MODULE_CACHE
         .lock()
@@ -80,6 +82,10 @@ fn cached_module(path: &Path) -> Result<CachedModule> {
     let mut config = Config::default();
     config.consume_fuel(true);
     let engine = Engine::new(&config);
+    anyhow::ensure!(
+        fs::metadata(path)?.len() <= 16 * 1024 * 1024,
+        "WASM module exceeds 16 MiB"
+    );
     let bytes = fs::read(path).with_context(|| format!("Could not read {}", path.display()))?;
     let module = Module::new(&engine, &bytes[..]).context("Invalid Super Widget WebAssembly")?;
     let cached = CachedModule {
@@ -92,6 +98,23 @@ fn cached_module(path: &Path) -> Result<CachedModule> {
         .expect("WASM module cache poisoned")
         .insert(path.to_path_buf(), cached.clone());
     Ok(cached)
+}
+
+pub(super) fn validate_module(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        fs::metadata(path)?.len() <= 16 * 1024 * 1024,
+        "WASM module exceeds 16 MiB"
+    );
+    let mut config = Config::default();
+    config.consume_fuel(true);
+    let engine = Engine::new(&config);
+    let module =
+        Module::new(&engine, &fs::read(path)?[..]).context("Invalid WebAssembly module")?;
+    anyhow::ensure!(
+        module.exports().any(|export| export.name() == "tf_render"),
+        "Module does not export tf_render"
+    );
+    Ok(())
 }
 
 fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
@@ -107,6 +130,10 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "telemetryforge",
         "clear",
         |mut caller: Caller<'_, HostState>, colour: i32| {
+            let pixels = caller.data().image.width() as u64 * caller.data().image.height() as u64;
+            if !spend(&mut caller, pixels) {
+                return;
+            }
             let colour = colour_value(colour);
             for pixel in caller.data_mut().image.pixels_mut() {
                 *pixel = colour;
@@ -123,6 +150,21 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          y2: f32,
          width: f32,
          colour: i32| {
+            if ![x1, y1, x2, y2, width].iter().all(|v| v.is_finite()) {
+                return;
+            }
+            let (x1, y1, x2, y2) = (
+                x1.clamp(-4096.0, 4096.0),
+                y1.clamp(-4096.0, 4096.0),
+                x2.clamp(-4096.0, 4096.0),
+                y2.clamp(-4096.0, 4096.0),
+            );
+            if !spend(
+                &mut caller,
+                (((x2 - x1).abs() + (y2 - y1).abs() + 1.0) * width.clamp(1.0, 128.0) * 2.0) as u64,
+            ) {
+                return;
+            }
             thick_line(
                 &mut caller.data_mut().image,
                 (x1, y1),
@@ -141,12 +183,24 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          radius: f32,
          width: f32,
          colour: i32| {
+            if ![cx, cy, radius, width].iter().all(|v| v.is_finite()) {
+                return;
+            }
+            if !spend(
+                &mut caller,
+                (radius.clamp(1.0, 4096.0) * width.clamp(1.0, 128.0) * 8.0) as u64,
+            ) {
+                return;
+            }
             let image = &mut caller.data_mut().image;
-            for offset in 0..width.max(1.0).round() as i32 {
+            for offset in 0..width.clamp(1.0, 128.0).round() as i32 {
                 draw_hollow_circle_mut(
                     image,
-                    (cx.round() as i32, cy.round() as i32),
-                    (radius - offset as f32).max(1.0).round() as i32,
+                    (
+                        cx.clamp(-4096.0, 4096.0).round() as i32,
+                        cy.clamp(-4096.0, 4096.0).round() as i32,
+                    ),
+                    (radius - offset as f32).clamp(1.0, 4096.0).round() as i32,
                     colour_value(colour),
                 );
             }
@@ -156,10 +210,22 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         "telemetryforge",
         "fill_circle",
         |mut caller: Caller<'_, HostState>, cx: f32, cy: f32, radius: f32, colour: i32| {
+            if ![cx, cy, radius].iter().all(|v| v.is_finite()) {
+                return;
+            }
+            if !spend(
+                &mut caller,
+                (radius.clamp(1.0, 4096.0).powi(2) * 4.0) as u64,
+            ) {
+                return;
+            }
             draw_filled_circle_mut(
                 &mut caller.data_mut().image,
-                (cx.round() as i32, cy.round() as i32),
-                radius.max(1.0).round() as i32,
+                (
+                    cx.clamp(-4096.0, 4096.0).round() as i32,
+                    cy.clamp(-4096.0, 4096.0).round() as i32,
+                ),
+                radius.clamp(1.0, 4096.0).round() as i32,
                 colour_value(colour),
             );
         },
@@ -175,9 +241,25 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          start: f32,
          sweep: f32,
          colour: i32| {
+            if ![cx, cy, radius, width, start, sweep]
+                .iter()
+                .all(|v| v.is_finite())
+            {
+                return;
+            }
+            if !spend(
+                &mut caller,
+                (radius.abs().min(4096.0)
+                    * sweep.abs().min(360.0).to_radians()
+                    * width.clamp(1.0, 128.0)
+                    * 4.0
+                    + 128.0) as u64,
+            ) {
+                return;
+            }
             draw_arc(
                 &mut caller.data_mut().image,
-                (cx, cy),
+                (cx.clamp(-4096.0, 4096.0), cy.clamp(-4096.0, 4096.0)),
                 radius,
                 width,
                 start,
@@ -196,6 +278,16 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          colour: i32,
          pointer: i32,
          length: i32| {
+            if ![x, y, size].iter().all(|v| v.is_finite()) {
+                return;
+            }
+            let size = size.clamp(4.0, 512.0);
+            if !spend(
+                &mut caller,
+                (length.clamp(0, 4096) as f32 * size * size) as u64,
+            ) {
+                return;
+            }
             let Some(memory) = caller
                 .get_export("memory")
                 .and_then(|item| item.into_memory())
@@ -219,8 +311,8 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
             draw_text_mut(
                 &mut caller.data_mut().image,
                 colour_value(colour),
-                x.round() as i32,
-                y.round() as i32,
+                x.clamp(-4096.0, 4096.0).round() as i32,
+                y.clamp(-4096.0, 4096.0).round() as i32,
                 size.max(4.0),
                 &font,
                 value,
@@ -237,6 +329,16 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          colour: i32,
          pointer: i32,
          length: i32| {
+            if ![x, y, size].iter().all(|v| v.is_finite()) {
+                return;
+            }
+            let size = size.clamp(4.0, 512.0);
+            if !spend(
+                &mut caller,
+                (length.clamp(0, 4096) as f32 * size * size) as u64,
+            ) {
+                return;
+            }
             let Some(value) = guest_text(&caller, pointer, length) else {
                 return;
             };
@@ -260,6 +362,13 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
          colour: i32,
          value: f32,
          decimals: i32| {
+            if ![x, y, size].iter().all(|v| v.is_finite()) {
+                return;
+            }
+            let size = size.clamp(4.0, 512.0);
+            if !spend(&mut caller, (40.0 * size * size) as u64) {
+                return;
+            }
             let value = match decimals.clamp(0, 3) {
                 0 => format!("{value:.0}"),
                 1 => format!("{value:.1}"),
@@ -277,6 +386,16 @@ fn define_host_functions(linker: &mut Linker<HostState>) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+fn spend(caller: &mut Caller<'_, HostState>, cost: u64) -> bool {
+    let state = caller.data_mut();
+    if cost > state.draw_budget {
+        state.draw_budget = 0;
+        return false;
+    }
+    state.draw_budget -= cost;
+    true
 }
 
 fn guest_text(caller: &Caller<'_, HostState>, pointer: i32, length: i32) -> Option<String> {
@@ -301,7 +420,9 @@ fn draw_centered_text(
     let Ok(font) = fonts::load("Bahnschrift") else {
         return;
     };
-    let size = size.max(4.0);
+    let size = size.clamp(4.0, 512.0);
+    let x = x.clamp(-4096.0, 4096.0);
+    let y = y.clamp(-4096.0, 4096.0);
     let scaled = font.as_scaled(size);
     let width: f32 = value
         .chars()
@@ -347,7 +468,7 @@ fn thick_line(
     width: f32,
     colour: Rgba<u8>,
 ) {
-    let width = width.max(1.0).round() as i32;
+    let width = width.clamp(1.0, 128.0).round() as i32;
     for offset in -(width / 2)..=(width / 2) {
         draw_line_segment_mut(
             image,
@@ -367,7 +488,9 @@ fn draw_arc(
     sweep: f32,
     colour: Rgba<u8>,
 ) {
-    let steps = (radius.abs() * sweep.abs().to_radians()).max(24.0) as usize;
+    let radius = radius.clamp(0.0, 4096.0);
+    let sweep = sweep.clamp(-360.0, 360.0);
+    let steps = (radius.abs() * sweep.abs().to_radians()).clamp(24.0, 4096.0) as usize;
     for step in 1..=steps {
         let previous = (step - 1) as f32 / steps as f32;
         let current = step as f32 / steps as f32;

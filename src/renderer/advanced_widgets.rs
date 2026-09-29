@@ -4,7 +4,9 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use chrono::Local;
-use image::{codecs::gif::GifDecoder, imageops, AnimationDecoder, RgbImage, Rgba, RgbaImage};
+use image::{
+    codecs::gif::GifDecoder, imageops, AnimationDecoder, ImageDecoder, RgbImage, Rgba, RgbaImage,
+};
 use imageproc::{
     drawing::{draw_hollow_rect_mut, draw_line_segment_mut, draw_text_mut},
     rect::Rect,
@@ -13,130 +15,253 @@ use std::{
     collections::HashMap,
     fs::File,
     io::BufReader,
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::{Instant, UNIX_EPOCH},
 };
 
-static GIF_CACHE: LazyLock<Mutex<HashMap<String, Vec<RgbaImage>>>> =
+static GIF_CACHE: LazyLock<Mutex<HashMap<String, Arc<Vec<RgbaImage>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static ANIMATION_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-pub fn draw_all(image: &mut RgbImage, config: &AppConfig, sensors: &SensorSnapshot) -> Result<()> {
-    for widget in config.widgets.iter().filter(|w| w.enabled) {
-        if widget.kind == WidgetKind::Gif {
-            draw_gif(image, widget)?;
+#[derive(Default)]
+pub struct LayerCache {
+    entries: Vec<Option<CachedLayer>>,
+    pub pending: bool,
+    pending_until: Option<Instant>,
+}
+impl LayerCache {
+    pub fn refresh_due(&self) -> bool {
+        self.pending_until
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+}
+struct CachedLayer {
+    config: WidgetConfig,
+    signature: u64,
+    updated: Instant,
+    layers: Vec<(RgbaImage, i32, i32)>,
+}
+
+pub fn draw_all(
+    image: &mut RgbImage,
+    config: &AppConfig,
+    sensors: &SensorSnapshot,
+    remote_texts: &HashMap<String, String>,
+) -> Result<()> {
+    draw_cached(
+        image,
+        config,
+        sensors,
+        remote_texts,
+        &mut LayerCache::default(),
+    )
+}
+
+pub fn draw_cached(
+    image: &mut RgbImage,
+    config: &AppConfig,
+    sensors: &SensorSnapshot,
+    remote_texts: &HashMap<String, String>,
+    cache: &mut LayerCache,
+) -> Result<()> {
+    cache.entries.resize_with(config.widgets.len(), || None);
+    cache.pending = false;
+    cache.pending_until = None;
+    let mut single = config.clone();
+    single.widgets.clear();
+    for (index, widget) in config.widgets.iter().enumerate() {
+        if !widget.enabled {
+            cache.entries[index] = None;
             continue;
         }
-        if widget.kind == WidgetKind::SuperWidget {
-            draw_superwidget(image, widget, sensors)?;
-            continue;
-        }
-        let padding = widget
-            .glow
-            .saturating_mul(3)
-            .max(widget.shadow.saturating_mul(2))
-            .saturating_add(6) as u32;
-        let mut local_widget = widget.clone();
-        local_widget.x = padding as i32;
-        local_widget.y = padding as i32;
-        let value = numeric(widget.kind, sensors);
-        let primary = if widget.use_thresholds
-            && matches!(
-                widget.render_mode,
-                WidgetRenderMode::Bar | WidgetRenderMode::Circle | WidgetRenderMode::Graph
-            ) {
-            parse(&widget.colour, widget.opacity)
-        } else {
-            opacity(active_colour(widget, value), widget.opacity)
-        };
-        let secondary = parse(&widget.secondary_colour, widget.opacity);
-        let mut layer = RgbaImage::new(
-            widget.width.max(1).saturating_add(padding * 2),
-            widget.height.max(1).saturating_add(padding * 2),
-        );
-        match widget.render_mode {
-            WidgetRenderMode::Text => {
-                let font = super::fonts::load(&widget.font)?;
-                let value = shown(widget.kind, sensors);
-                let middle = widget
-                    .label_format
-                    .replace("{value:.0}", &value)
-                    .replace("{value}", &value);
-                let text = format!("{}{}{}", widget.left_text, middle, widget.right_text);
-                if widget.kind == WidgetKind::WeatherIcon {
-                    draw_centred_glyph(&mut layer, &local_widget, primary, &font, &text);
-                } else {
-                    draw_text_mut(
-                        &mut layer,
-                        primary,
-                        local_widget.x,
-                        local_widget.y,
-                        widget.font_size,
-                        &font,
-                        &text,
+        single.widgets.clear();
+        single.widgets.push(widget.clone());
+        let signature = super::visual_signature(&single, sensors, remote_texts);
+        let old = &cache.entries[index];
+        let config_changed = old.as_ref().is_none_or(|old| old.config != *widget);
+        let changed = old.as_ref().is_none_or(|old| old.signature != signature);
+        let animated = widget.kind == WidgetKind::Gif
+            || (widget.kind == WidgetKind::SuperWidget
+                && widget
+                    .superwidget_id
+                    .as_deref()
+                    .and_then(crate::superwidgets::find)
+                    .is_some_and(|m| m.animated_fps > 0));
+        let due = animated
+            || old.as_ref().is_none_or(|old| {
+                old.updated.elapsed().as_millis()
+                    >= widget.refresh_interval_ms.clamp(50, 60_000) as u128
+            });
+        if config_changed || (changed && due) {
+            cache.entries[index] = Some(CachedLayer {
+                config: widget.clone(),
+                signature,
+                updated: Instant::now(),
+                layers: widget_layers(widget, sensors, remote_texts)?,
+            });
+        } else if changed {
+            cache.pending = true;
+            if let Some(old) = old {
+                let deadline = old.updated
+                    + std::time::Duration::from_millis(
+                        widget.refresh_interval_ms.clamp(50, 60_000),
                     );
-                }
+                cache.pending_until = Some(
+                    cache
+                        .pending_until
+                        .map_or(deadline, |previous| previous.min(deadline)),
+                );
             }
-            WidgetRenderMode::Bar => bar(
-                &mut layer,
-                &local_widget,
-                ratio(widget.kind, value),
-                primary,
-                secondary,
-            ),
-            WidgetRenderMode::Circle => circle(
-                &mut layer,
-                &local_widget,
-                ratio(widget.kind, value),
-                primary,
-                secondary,
-            ),
-            WidgetRenderMode::Graph => graph(
-                &mut layer,
-                &local_widget,
-                history(widget.kind, sensors),
-                primary,
-                secondary,
-            ),
         }
-        let origin_x = widget.x - padding as i32;
-        let origin_y = widget.y - padding as i32;
-        if widget.shadow > 0 {
-            composite(
-                image,
-                &tint(
-                    &imageops::blur(&layer, widget.shadow as f32 / 2.0),
-                    Rgba([0, 0, 0, 160]),
-                ),
-                origin_x + 3,
-                origin_y + 3,
-            );
+        if let Some(cached) = &cache.entries[index] {
+            for (layer, x, y) in &cached.layers {
+                composite(image, layer, *x, *y);
+            }
         }
-        if widget.glow > 0 {
-            composite(
-                image,
-                &imageops::blur(&layer, widget.glow as f32),
-                origin_x,
-                origin_y,
-            );
-        }
-        composite(image, &layer, origin_x, origin_y);
     }
     Ok(())
 }
 
-fn draw_superwidget(
-    image: &mut RgbImage,
+fn widget_layers(
     widget: &WidgetConfig,
     sensors: &SensorSnapshot,
-) -> Result<()> {
+    remote_texts: &HashMap<String, String>,
+) -> Result<Vec<(RgbaImage, i32, i32)>> {
+    if widget.kind == WidgetKind::Gif {
+        let mut layer = gif_layer(widget)?;
+        apply_opacity(&mut layer, widget.opacity);
+        return Ok(vec![(layer, widget.x, widget.y)]);
+    }
+    if widget.kind == WidgetKind::SuperWidget {
+        let mut layer = superwidget_layer(widget, sensors)?;
+        apply_opacity(&mut layer, widget.opacity);
+        return Ok(vec![(layer, widget.x, widget.y)]);
+    }
+    let padding = widget
+        .glow
+        .saturating_mul(3)
+        .max(widget.shadow.saturating_mul(2))
+        .saturating_add(6) as u32;
+    let mut local_widget = widget.clone();
+    local_widget.x = padding as i32;
+    local_widget.y = padding as i32;
+    let value = numeric(widget.kind, sensors);
+    let primary = if widget.use_thresholds
+        && matches!(
+            widget.render_mode,
+            WidgetRenderMode::Bar | WidgetRenderMode::Circle | WidgetRenderMode::Graph
+        ) {
+        parse(&widget.colour, widget.opacity)
+    } else {
+        opacity(active_colour(widget, value), widget.opacity)
+    };
+    let secondary = parse(&widget.secondary_colour, widget.opacity);
+    let mut layer = RgbaImage::new(
+        widget.width.max(1).saturating_add(padding * 2),
+        widget.height.max(1).saturating_add(padding * 2),
+    );
+    match widget.render_mode {
+        WidgetRenderMode::Text => {
+            let font = super::fonts::load(&widget.font)?;
+            let value = shown(widget, sensors, remote_texts);
+            let middle = widget
+                .label_format
+                .replace("{value:.0}", &value)
+                .replace("{value}", &value);
+            let text = format!("{}{}{}", widget.left_text, middle, widget.right_text);
+            if widget.kind == WidgetKind::WeatherIcon {
+                draw_centred_glyph(&mut layer, &local_widget, primary, &font, &text);
+            } else {
+                draw_text_mut(
+                    &mut layer,
+                    primary,
+                    local_widget.x,
+                    local_widget.y,
+                    widget.font_size,
+                    &font,
+                    &text,
+                );
+            }
+        }
+        WidgetRenderMode::Bar => bar(
+            &mut layer,
+            &local_widget,
+            ratio(widget.kind, value),
+            primary,
+            secondary,
+        ),
+        WidgetRenderMode::Circle => circle(
+            &mut layer,
+            &local_widget,
+            ratio(widget.kind, value),
+            primary,
+            secondary,
+        ),
+        WidgetRenderMode::Graph => graph(
+            &mut layer,
+            &local_widget,
+            if value.is_none() {
+                &[]
+            } else {
+                history(widget.kind, sensors)
+            },
+            primary,
+            secondary,
+        ),
+    }
+    if value.is_none()
+        && widget.render_mode != WidgetRenderMode::Text
+        && !matches!(
+            widget.kind,
+            WidgetKind::Text | WidgetKind::Clock | WidgetKind::Date | WidgetKind::RemoteText
+        )
+    {
+        let font = super::fonts::load(&widget.font)?;
+        let mut placeholder = local_widget.clone();
+        placeholder.font_size = widget.font_size.min(widget.height as f32).max(8.0);
+        draw_centred_glyph(&mut layer, &placeholder, primary, &font, "--");
+    }
+    let origin_x = widget.x - padding as i32;
+    let origin_y = widget.y - padding as i32;
+    let mut layers = Vec::new();
+    if widget.shadow > 0 {
+        layers.push((
+            tint(
+                &imageops::blur(&layer, widget.shadow as f32 / 2.0),
+                Rgba([0, 0, 0, 160]),
+            ),
+            origin_x + 3,
+            origin_y + 3,
+        ));
+    }
+    if widget.glow > 0 {
+        layers.push((
+            imageops::blur(&layer, widget.glow as f32),
+            origin_x,
+            origin_y,
+        ));
+    }
+    layers.push((layer, origin_x, origin_y));
+    Ok(layers)
+}
+
+fn apply_opacity(layer: &mut RgbaImage, opacity: f32) {
+    if opacity >= 1.0 {
+        return;
+    }
+    for pixel in layer.pixels_mut() {
+        pixel[3] = (pixel[3] as f32 * opacity.clamp(0.0, 1.0)) as u8;
+    }
+}
+
+fn superwidget_layer(widget: &WidgetConfig, sensors: &SensorSnapshot) -> Result<RgbaImage> {
     let Some(id) = widget.superwidget_id.as_deref() else {
-        return Ok(());
+        return Ok(RgbaImage::new(1, 1));
     };
     let Some(manifest) = crate::superwidgets::find(id) else {
-        return Ok(());
+        return Ok(RgbaImage::new(1, 1));
     };
-    let rendered = crate::superwidgets::renderer::draw(
+    crate::superwidgets::renderer::draw(
         &manifest,
         widget.width,
         widget.height,
@@ -144,20 +269,12 @@ fn draw_superwidget(
         &widget.superwidget_background_colour,
         widget.superwidget_background_opacity,
         &widget.superwidget_bindings,
-    )?;
-    composite_rgba(
-        image,
-        &rendered,
-        widget.x,
-        widget.y,
-        widget.opacity.clamp(0.0, 1.0),
-    );
-    Ok(())
+    )
 }
 
-fn draw_gif(image: &mut RgbImage, widget: &WidgetConfig) -> Result<()> {
+fn gif_layer(widget: &WidgetConfig) -> Result<RgbaImage> {
     let Some(path) = widget.gif_path.as_deref().filter(|path| !path.is_empty()) else {
-        return Ok(());
+        return Ok(RgbaImage::new(1, 1));
     };
     let modified = std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -169,24 +286,41 @@ fn draw_gif(image: &mut RgbImage, widget: &WidgetConfig) -> Result<()> {
     let frames = {
         let mut cache = GIF_CACHE.lock().expect("GIF cache poisoned");
         if !cache.contains_key(&key) {
-            let decoder = GifDecoder::new(BufReader::new(
+            let mut decoder = GifDecoder::new(BufReader::new(
                 File::open(path).with_context(|| format!("Could not open GIF {path}"))?,
             ))
             .with_context(|| format!("Could not decode GIF {path}"))?;
-            let decoded = decoder
-                .into_frames()
-                .collect_frames()
-                .with_context(|| format!("Could not read GIF frames from {path}"))?
-                .into_iter()
-                .map(|frame| frame.into_buffer())
-                .collect::<Vec<_>>();
+            let mut limits = image::Limits::default();
+            limits.max_alloc = Some(64 * 1024 * 1024);
+            limits.max_image_width = Some(4096);
+            limits.max_image_height = Some(4096);
+            decoder.set_limits(limits)?;
+            let mut decoded = Vec::new();
+            let mut bytes = 0usize;
+            for frame in decoder.into_frames() {
+                let frame = frame?.into_buffer();
+                bytes = bytes.saturating_add(frame.as_raw().len());
+                anyhow::ensure!(
+                    bytes <= 64 * 1024 * 1024 && decoded.len() < 2000,
+                    "GIF exceeds the decoded memory/frame limit (64 MiB / 2000 frames)"
+                );
+                decoded.push(frame);
+            }
             cache.retain(|cached_key, _| !cached_key.starts_with(&format!("{path}:")));
-            cache.insert(key.clone(), decoded);
+            let cached_bytes: usize = cache
+                .values()
+                .flat_map(|frames| frames.iter())
+                .map(|frame| frame.as_raw().len())
+                .sum();
+            if cached_bytes + bytes > 128 * 1024 * 1024 {
+                cache.clear();
+            }
+            cache.insert(key.clone(), Arc::new(decoded));
         }
         cache.get(&key).cloned().unwrap_or_default()
     };
     if frames.is_empty() || widget.width == 0 || widget.height == 0 {
-        return Ok(());
+        return Ok(RgbaImage::new(1, 1));
     }
     let elapsed_ms = ANIMATION_START.elapsed().as_millis();
     let frame_duration = (1000 / widget.gif_fps.clamp(1, 30) as u128).max(1);
@@ -196,15 +330,12 @@ fn draw_gif(image: &mut RgbImage, widget: &WidgetConfig) -> Result<()> {
     } else {
         raw_index.min(frames.len() - 1)
     };
-    let fitted = fit_gif_frame(&frames[index], widget.width, widget.height, widget.gif_fit);
-    composite_rgba(
-        image,
-        &fitted,
-        widget.x,
-        widget.y,
-        widget.opacity.clamp(0.0, 1.0),
-    );
-    Ok(())
+    Ok(fit_gif_frame(
+        &frames[index],
+        widget.width,
+        widget.height,
+        widget.gif_fit,
+    ))
 }
 
 fn fit_gif_frame(source: &RgbaImage, width: u32, height: u32, mode: BackgroundMode) -> RgbaImage {
@@ -254,29 +385,10 @@ fn fit_gif_frame(source: &RgbaImage, width: u32, height: u32, mode: BackgroundMo
         }
         BackgroundMode::Centre => {
             let mut canvas = RgbaImage::new(width, height);
-            let x = width.saturating_sub(source.width()) / 2;
-            let y = height.saturating_sub(source.height()) / 2;
-            imageops::overlay(&mut canvas, source, x as i64, y as i64);
+            let x = (width as i64 - source.width() as i64) / 2;
+            let y = (height as i64 - source.height() as i64) / 2;
+            imageops::overlay(&mut canvas, source, x, y);
             canvas
-        }
-    }
-}
-
-fn composite_rgba(dst: &mut RgbImage, src: &RgbaImage, ox: i32, oy: i32, opacity: f32) {
-    for (x, y, pixel) in src.enumerate_pixels() {
-        let tx = ox + x as i32;
-        let ty = oy + y as i32;
-        if tx < 0 || ty < 0 || tx >= dst.width() as i32 || ty >= dst.height() as i32 {
-            continue;
-        }
-        let alpha = pixel[3] as f32 / 255.0 * opacity;
-        if alpha <= 0.0 {
-            continue;
-        }
-        let target = dst.get_pixel_mut(tx as u32, ty as u32);
-        for channel in 0..3 {
-            target[channel] =
-                (target[channel] as f32 * (1.0 - alpha) + pixel[channel] as f32 * alpha) as u8;
         }
     }
 }
@@ -504,24 +616,33 @@ fn numeric(k: WidgetKind, s: &SensorSnapshot) -> Option<f32> {
         WidgetKind::WeatherWind => s.weather_wind_speed,
         WidgetKind::WeatherCondition => None,
         WidgetKind::WeatherIcon => None,
+        WidgetKind::RemoteText => None,
         WidgetKind::Gif => None,
         WidgetKind::SuperWidget => None,
         _ => None,
     }
 }
-fn shown(k: WidgetKind, s: &SensorSnapshot) -> String {
-    match k {
+fn shown(
+    widget: &WidgetConfig,
+    s: &SensorSnapshot,
+    remote_texts: &HashMap<String, String>,
+) -> String {
+    match widget.kind {
         WidgetKind::Clock => Local::now().format("%H:%M").to_string(),
         WidgetKind::Date => Local::now().format("%d/%m/%Y").to_string(),
         WidgetKind::CpuClock => frequency(s.cpu_clock),
         WidgetKind::GpuClock => frequency(s.gpu_clock),
         WidgetKind::Text => String::new(),
+        WidgetKind::RemoteText => remote_texts
+            .get(&widget.remote_text_key)
+            .cloned()
+            .unwrap_or_else(|| "Waiting…".into()),
         WidgetKind::Gif => String::new(),
         WidgetKind::SuperWidget => String::new(),
         WidgetKind::Fps => "--".into(),
         WidgetKind::WeatherCondition => s.weather_condition.clone().unwrap_or_else(|| "--".into()),
         WidgetKind::WeatherIcon => s.weather_code.map(weather_icon).unwrap_or("--").into(),
-        _ => numeric(k, s)
+        _ => numeric(widget.kind, s)
             .map(|v| format!("{v:.0}"))
             .unwrap_or_else(|| "--".into()),
     }
@@ -646,15 +767,7 @@ fn ratio(k: WidgetKind, v: Option<f32>) -> f32 {
     (v.unwrap_or(0.0) / max_for(k)).clamp(0.0, 1.0)
 }
 fn history(k: WidgetKind, s: &SensorSnapshot) -> &[f32] {
-    match k {
-        WidgetKind::CpuUsage | WidgetKind::CpuTemperature | WidgetKind::CpuClock => &s.history_cpu,
-        WidgetKind::GpuUsage | WidgetKind::GpuTemperature | WidgetKind::GpuClock => &s.history_gpu,
-        WidgetKind::GpuPower => &s.history_gpu_power,
-        WidgetKind::NetworkUpload => &s.history_network_upload,
-        WidgetKind::NetworkDownload => &s.history_network_download,
-        WidgetKind::Volume => &s.history_volume,
-        _ => &[],
-    }
+    s.history(k)
 }
 fn parse(s: &str, o: f32) -> Rgba<u8> {
     let c = super::canvas::parse_colour(s);
@@ -709,6 +822,55 @@ fn inside(i: &RgbaImage, x: i32, y: i32) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cached_layers_preserve_overlap_and_respect_refresh_intervals() {
+        let mut config = AppConfig::default();
+        let mut bar = WidgetConfig::new(WidgetKind::CpuUsage, 5, 5, "{value}");
+        bar.render_mode = WidgetRenderMode::Bar;
+        bar.width = 70;
+        bar.height = 25;
+        bar.refresh_interval_ms = 60_000;
+        let mut overlay = bar.clone();
+        overlay.kind = WidgetKind::RamUsage;
+        overlay.x = 15;
+        overlay.y = 10;
+        overlay.opacity = 0.4;
+        config.widgets = vec![bar, overlay];
+        let mut sensors = SensorSnapshot {
+            cpu_usage: Some(10.0),
+            ram_usage: Some(50.0),
+            ..Default::default()
+        };
+        let mut cache = LayerCache::default();
+        let texts = HashMap::new();
+        let mut first = super::super::background::create(&config).unwrap();
+        draw_cached(&mut first, &config, &sensors, &texts, &mut cache).unwrap();
+        assert_eq!(
+            first,
+            super::super::render(&config, &sensors, &texts).unwrap()
+        );
+        sensors.cpu_usage = Some(95.0);
+        let mut held = super::super::background::create(&config).unwrap();
+        draw_cached(&mut held, &config, &sensors, &texts, &mut cache).unwrap();
+        assert_eq!(held, first);
+        assert!(cache.pending);
+        assert!(
+            !cache.refresh_due(),
+            "pending layers must not trigger premature recomposition"
+        );
+        cache.pending_until = Some(Instant::now() - std::time::Duration::from_millis(1));
+        assert!(cache.refresh_due());
+        cache.entries[0].as_mut().unwrap().updated =
+            Instant::now() - std::time::Duration::from_secs(61);
+        let mut changed = super::super::background::create(&config).unwrap();
+        draw_cached(&mut changed, &config, &sensors, &texts, &mut cache).unwrap();
+        assert_eq!(
+            changed,
+            super::super::render(&config, &sensors, &texts).unwrap()
+        );
+        assert_ne!(first, changed);
+    }
+
     fn threshold_widget() -> WidgetConfig {
         let mut widget = WidgetConfig::new(WidgetKind::CpuUsage, 0, 0, "{value}");
         widget.render_mode = WidgetRenderMode::Bar;
@@ -719,6 +881,36 @@ mod tests {
         widget.warning_threshold = 70.0;
         widget.critical_threshold = 90.0;
         widget
+    }
+
+    #[test]
+    fn missing_sensor_is_not_rendered_or_cached_as_zero() {
+        let mut config = AppConfig::default();
+        let texts = HashMap::new();
+        let missing = SensorSnapshot::default();
+        let zero = SensorSnapshot {
+            gpu_usage: Some(0.0),
+            ..Default::default()
+        };
+        for mode in [
+            WidgetRenderMode::Bar,
+            WidgetRenderMode::Circle,
+            WidgetRenderMode::Graph,
+        ] {
+            let mut widget = WidgetConfig::new(WidgetKind::GpuUsage, 0, 0, "{value}");
+            widget.width = 100;
+            widget.height = 50;
+            widget.render_mode = mode;
+            config.widgets = vec![widget];
+            assert_ne!(
+                super::super::visual_signature(&config, &missing, &texts),
+                super::super::visual_signature(&config, &zero, &texts)
+            );
+            assert_ne!(
+                super::super::render(&config, &missing, &texts).unwrap(),
+                super::super::render(&config, &zero, &texts).unwrap()
+            );
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{net::SocketAddr, sync::atomic::Ordering, time::Duration};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -31,6 +31,11 @@ struct ApiResponse {
     ok: bool,
     result: Value,
     error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RemoteTextUpdate {
+    text: String,
 }
 
 pub async fn manage(state: AppState) {
@@ -68,25 +73,37 @@ pub async fn manage(state: AppState) {
 }
 
 async fn serve(state: AppState, shutdown: oneshot::Receiver<()>) -> anyhow::Result<()> {
-    let app = Router::new()
+    let running = state.remote_running.clone();
+    let app = router(state);
+    let address = SocketAddr::from(([0, 0, 0, 0], 8787));
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    running.store(true, Ordering::Relaxed);
+    tracing::info!(%address, "TelemetryForge Remote Deck listening");
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = shutdown.await;
+        })
+        .await;
+    running.store(false, Ordering::Relaxed);
+    result?;
+    Ok(())
+}
+
+fn router(state: AppState) -> Router {
+    Router::new()
         .route("/", get(index))
         .route("/styles.css", get(styles))
         .route("/i18n.js", get(i18n))
         .route("/remote-bridge.js", get(bridge))
         .route("/app-v2.js", get(app_script))
         .route("/api/invoke/{command}", post(invoke))
+        .route(
+            "/api/widget-text/{key}",
+            post(update_widget_text).layer(axum::extract::DefaultBodyLimit::max(8192)),
+        )
         .route("/api/health", get(health))
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
-        .with_state(state);
-    let address = SocketAddr::from(([0, 0, 0, 0], 8787));
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    tracing::info!(%address, "TelemetryForge Remote Deck listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = shutdown.await;
-        })
-        .await?;
-    Ok(())
+        .with_state(state)
 }
 
 async fn authorize(
@@ -95,24 +112,37 @@ async fn authorize(
     next: Next,
 ) -> Response<Body> {
     let remote = state.config.read().remote.clone();
-    if !remote.authentication_enabled {
-        return next.run(request).await;
-    }
-    let authorized = request
+    let authorization = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Basic "))
+        .unwrap_or("")
+        .to_owned();
+    if let Some(token) = authorization.strip_prefix("Bearer ") {
+        let text_only = request.method() == axum::http::Method::POST
+            && request.uri().path().starts_with("/api/widget-text/");
+        if text_only
+            && crate::remote_auth::verify_request(token.to_owned(), remote.text_token_hash).await
+        {
+            return next.run(request).await;
+        }
+        return (StatusCode::UNAUTHORIZED, "Invalid token or token scope").into_response();
+    }
+    if !remote.authentication_enabled {
+        return next.run(request).await;
+    }
+    let credentials = authorization
+        .strip_prefix("Basic ")
         .and_then(|encoded| STANDARD.decode(encoded).ok())
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|credentials| {
             let (username, password) = credentials.split_once(':')?;
-            Some(
-                username == remote.username
-                    && crate::remote_auth::verify_password(password, &remote.password_hash),
-            )
-        })
-        .unwrap_or(false);
+            (username == remote.username).then(|| password.to_owned())
+        });
+    let authorized = match credentials {
+        Some(password) => crate::remote_auth::verify_request(password, remote.password_hash).await,
+        None => false,
+    };
     if authorized {
         next.run(request).await
     } else {
@@ -130,6 +160,50 @@ async fn authorize(
 
 async fn health() -> Json<Value> {
     Json(json!({"name":"TelemetryForge Remote Deck","version":env!("CARGO_PKG_VERSION")}))
+}
+
+/// Lightweight external-data endpoint. It shares the Remote Deck's auth
+/// middleware, but does not write a screen/configuration file.
+async fn update_widget_text(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(payload): Json<RemoteTextUpdate>,
+) -> impl IntoResponse {
+    let key = key.trim();
+    if key.is_empty()
+        || key.len() > 64
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return (StatusCode::BAD_REQUEST, Json(json!({"ok":false,"error":"Use a key up to 64 characters: letters, numbers, -, _ or ."}))).into_response();
+    }
+    if payload.text.chars().count() > 512 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok":false,"error":"Text exceeds 512 characters"})),
+        )
+            .into_response();
+    }
+    let mut texts = state.remote_texts.write();
+    if texts.len() >= 256 && !texts.contains_key(key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"ok":false,"error":"Remote text key limit reached (256)"})),
+        )
+            .into_response();
+    }
+    let changed = texts.get(key) != Some(&payload.text);
+    if changed {
+        texts.insert(key.to_owned(), payload.text);
+    }
+    // The visual signature already observes this map. A data update must not
+    // trigger a screen transition or override automatic screen switching.
+    (
+        StatusCode::OK,
+        Json(json!({"ok":true,"key":key,"changed":changed})),
+    )
+        .into_response()
 }
 
 async fn index() -> impl IntoResponse {
@@ -173,7 +247,10 @@ async fn invoke(
     let arguments = payload
         .map(|Json(value)| value)
         .unwrap_or_else(|| json!({}));
-    match invoke_command(&state, &command, arguments).await {
+    let result = tokio::task::spawn_blocking(move || invoke_command(&state, &command, arguments))
+        .await
+        .unwrap_or_else(|error| Err(format!("Remote command failed: {error}")));
+    match result {
         Ok(result) => (
             StatusCode::OK,
             Json(ApiResponse {
@@ -193,7 +270,7 @@ async fn invoke(
     }
 }
 
-async fn invoke_command(state: &AppState, command: &str, args: Value) -> Result<Value, String> {
+fn invoke_command(state: &AppState, command: &str, args: Value) -> Result<Value, String> {
     match command {
         "get_config" => value(ui::public_config(state.config.read().clone())),
         "get_remote_info" => value(ui::remote_info_state(state)),
@@ -340,7 +417,8 @@ fn merge_screen_settings(mut screen: AppConfig, current: &AppConfig) -> AppConfi
 }
 
 fn preview(state: &AppState, config: AppConfig) -> Result<Value, String> {
-    let image = renderer::render(&config, &state.sensors.read()).map_err(error)?;
+    let image = renderer::render(&config, &state.sensors.read(), &state.remote_texts.read())
+        .map_err(error)?;
     let png = renderer::canvas::png_bytes(&image).map_err(error)?;
     value(format!("data:image/png;base64,{}", STANDARD.encode(png)))
 }
@@ -369,7 +447,7 @@ fn render_once(state: &AppState) -> Result<(), String> {
         config.disk_source.as_deref(),
         &config.weather,
     );
-    let image = renderer::render(&config, &snapshot).map_err(error)?;
+    let image = renderer::render(&config, &snapshot, &state.remote_texts.read()).map_err(error)?;
     display_driver::send_frame(&config.display, &image).map_err(error)?;
     *state.sensors.write() = snapshot;
     *state.status.write() = "Frame sent".into();
@@ -423,4 +501,116 @@ fn value<T: Serialize>(value: T) -> Result<Value, String> {
 
 fn error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::{Mutex, RwLock};
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicBool, AtomicU64},
+            Arc,
+        },
+    };
+
+    #[test]
+    fn http_text_token_is_scoped_and_posts_do_not_change_scene() {
+        let root = crate::safe_files::Staging::new(&std::env::temp_dir()).unwrap();
+        let mut config = AppConfig::default();
+        config.remote.authentication_enabled = true;
+        config.remote.password_hash =
+            crate::remote_auth::hash_password("admin-password-test").unwrap();
+        config.remote.text_token_hash =
+            crate::remote_auth::hash_password("text-token-for-test").unwrap();
+        let state = AppState {
+            config_path: root.0.join("config.yaml"),
+            config: Arc::new(RwLock::new(config)),
+            sensors: Arc::new(RwLock::new(Default::default())),
+            worker: Arc::new(Mutex::new(None)),
+            status: Arc::new(RwLock::new(String::new())),
+            scene_revision: Arc::new(AtomicU64::new(7)),
+            active_screen: Arc::new(RwLock::new(None)),
+            remote_texts: Arc::new(RwLock::new(HashMap::new())),
+            remote_running: Arc::new(AtomicBool::new(false)),
+            diagnostics: Arc::new(RwLock::new(Default::default())),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = router(state.clone());
+        let server = runtime.spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let text_url = format!("{url}/api/widget-text/status");
+        assert_eq!(
+            client
+                .post(&text_url)
+                .json(&json!({"text":"Hello"}))
+                .send()
+                .unwrap()
+                .status(),
+            401
+        );
+        for changed in [true, false] {
+            let response = client
+                .post(&text_url)
+                .bearer_auth("text-token-for-test")
+                .json(&json!({"text":"Hello"}))
+                .send()
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.json::<Value>().unwrap()["changed"], changed);
+        }
+        assert_eq!(state.scene_revision.load(Ordering::Relaxed), 7);
+        assert_eq!(state.remote_texts.read()["status"], "Hello");
+        assert_eq!(
+            client
+                .post(format!("{url}/api/invoke/get_config"))
+                .bearer_auth("text-token-for-test")
+                .json(&json!({}))
+                .send()
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .post(&text_url)
+                .bearer_auth("text-token-for-test")
+                .json(&json!({"text":"x".repeat(513)}))
+                .send()
+                .unwrap()
+                .status(),
+            400
+        );
+        state.config.write().remote.text_token_hash.clear();
+        assert_eq!(
+            client
+                .post(&text_url)
+                .bearer_auth("text-token-for-test")
+                .json(&json!({"text":"No"}))
+                .send()
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            client
+                .get(format!("{url}/api/health"))
+                .basic_auth("admin", Some("admin-password-test"))
+                .send()
+                .unwrap()
+                .status(),
+            200
+        );
+        server.abort();
+    }
 }

@@ -11,6 +11,7 @@ use anyhow::Result;
 use image::RgbImage;
 use std::{
     collections::hash_map::DefaultHasher,
+    collections::HashMap,
     hash::{Hash, Hasher},
     sync::LazyLock,
     time::Instant,
@@ -18,17 +19,42 @@ use std::{
 
 static ANIMATION_START: LazyLock<Instant> = LazyLock::new(Instant::now);
 
-pub fn render(config: &AppConfig, sensors: &SensorSnapshot) -> Result<RgbImage> {
+pub fn render(
+    config: &AppConfig,
+    sensors: &SensorSnapshot,
+    remote_texts: &HashMap<String, String>,
+) -> Result<RgbImage> {
+    config.validate()?;
     let mut frame = background::create(config)?;
-    advanced_widgets::draw_all(&mut frame, config, sensors)?;
+    advanced_widgets::draw_all(&mut frame, config, sensors, remote_texts)?;
     Ok(frame)
 }
 
-pub fn visual_signature(config: &AppConfig, sensors: &SensorSnapshot) -> u64 {
+pub fn visual_signature(
+    config: &AppConfig,
+    sensors: &SensorSnapshot,
+    remote_texts: &HashMap<String, String>,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     for widget in config.widgets.iter().filter(|widget| widget.enabled) {
         widget.kind.hash(&mut hasher);
         widget.render_mode.hash(&mut hasher);
+        numeric(widget.kind, sensors).is_some().hash(&mut hasher);
+        if widget.kind == WidgetKind::Clock || widget.kind == WidgetKind::Date {
+            chrono::Local::now()
+                .format(if widget.kind == WidgetKind::Clock {
+                    "%Y%m%d%H%M"
+                } else {
+                    "%Y%m%d"
+                })
+                .to_string()
+                .hash(&mut hasher);
+        }
+        if widget.kind == WidgetKind::RemoteText {
+            widget.remote_text_key.hash(&mut hasher);
+            remote_texts.get(&widget.remote_text_key).hash(&mut hasher);
+            continue;
+        }
         if matches!(
             widget.kind,
             WidgetKind::WeatherCondition | WidgetKind::WeatherIcon
@@ -44,6 +70,18 @@ pub fn visual_signature(config: &AppConfig, sensors: &SensorSnapshot) -> u64 {
             continue;
         }
         if widget.kind == WidgetKind::SuperWidget {
+            for sensor in &sensors.fan_sensors {
+                sensor.id.hash(&mut hasher);
+                sensor.value.to_bits().hash(&mut hasher);
+            }
+            sensors
+                .cpu_temperature_core
+                .map(f32::to_bits)
+                .hash(&mut hasher);
+            sensors
+                .cpu_temperature_socket
+                .map(f32::to_bits)
+                .hash(&mut hasher);
             if let Some(fps) = widget
                 .superwidget_id
                 .as_deref()
@@ -97,7 +135,9 @@ pub fn visual_signature(config: &AppConfig, sensors: &SensorSnapshot) -> u64 {
 }
 
 fn quantized_ratio(kind: WidgetKind, sensors: &SensorSnapshot, steps: f32) -> i64 {
-    let value = numeric(kind, sensors).unwrap_or_default();
+    let Some(value) = numeric(kind, sensors) else {
+        return -1;
+    };
     ((value / maximum(kind)).clamp(0.0, 1.0) * steps).floor() as i64
 }
 
@@ -126,6 +166,7 @@ fn numeric(kind: WidgetKind, sensors: &SensorSnapshot) -> Option<f32> {
         | WidgetKind::Date
         | WidgetKind::Fps
         | WidgetKind::Text
+        | WidgetKind::RemoteText
         | WidgetKind::Gif => None,
         WidgetKind::SuperWidget => None,
     }
@@ -146,17 +187,5 @@ fn maximum(kind: WidgetKind) -> f32 {
 }
 
 fn history(kind: WidgetKind, sensors: &SensorSnapshot) -> &[f32] {
-    match kind {
-        WidgetKind::CpuUsage | WidgetKind::CpuTemperature | WidgetKind::CpuClock => {
-            &sensors.history_cpu
-        }
-        WidgetKind::GpuUsage | WidgetKind::GpuTemperature | WidgetKind::GpuClock => {
-            &sensors.history_gpu
-        }
-        WidgetKind::GpuPower => &sensors.history_gpu_power,
-        WidgetKind::NetworkUpload => &sensors.history_network_upload,
-        WidgetKind::NetworkDownload => &sensors.history_network_download,
-        WidgetKind::Volume => &sensors.history_volume,
-        _ => &[],
-    }
+    sensors.history(kind)
 }

@@ -39,9 +39,23 @@
       <div class="screen" id="screen">
         <img id="preview" alt="Display preview" data-i18n-alt="previewAlt" />
         <div id="widget-overlay"></div>
+        <div id="alignment-guides" aria-hidden="true"></div>
+      </div>
+      <div class="actions editor-precision">
+        <label><span data-i18n="snapGrid">Snap grid</span> <select id="snap-grid"><option value="0" data-i18n="snapOff">Off</option><option value="4">4 px</option><option value="8">8 px</option><option value="16">16 px</option></select></label>
+        <label><input type="checkbox" id="snap-guides" checked /> <span data-i18n="alignmentGuides">Alignment guides</span></label>
+        <span class="hint" data-i18n="precisionHint">Alt: bypass snapping · Arrow keys: 1 px · Shift: 10 px</span>
       </div>
       <p class="hint" data-i18n="editorHint">Drag to move. Drag on the background to select multiple objects, or use Ctrl+click. Right-click to align.</p>
       <p id="error"></p>
+      <details id="diagnostics-panel">
+        <summary data-i18n="diagnostics">Live diagnostics</summary>
+        <p id="diagnostics-values" class="hint" aria-live="off"></p>
+        <p class="hint" data-i18n="diagnosticsHint">FPS counts display updates over 5 seconds, not game FPS. Static screens should approach zero. USB counts RGB565 payload, excluding protocol headers. Counters reset on Start.</p>
+        <h3 data-i18n="sensorHealth">Sensor health</h3>
+        <p class="hint" data-i18n="sensorHealthHint">Cached readings; opening this panel does not start another hardware poll. Age is time since the source was sampled, not since the value changed.</p>
+        <div class="sensor-health-scroll"><table class="sensor-health"><thead><tr><th data-i18n="sensorColumn">Sensor</th><th data-i18n="valueColumn">Value</th><th data-i18n="sourceColumn">Source</th><th data-i18n="ageColumn">Age</th><th data-i18n="healthColumn">Status</th></tr></thead><tbody id="sensor-health-values"></tbody></table></div>
+      </details>
     </section>
     <section class="editor">
       <div class="card">
@@ -120,6 +134,8 @@
           <label class="checkline"><input id="remote-auth-enabled" type="checkbox" /><span data-i18n="enableRemoteAuthentication">Require username and password</span></label>
           <label><span data-i18n="remoteUsername">Username</span><input id="remote-username" autocomplete="username" /></label>
           <label><span data-i18n="remotePassword">New password</span><input id="remote-password" type="password" minlength="8" autocomplete="new-password" /></label>
+          <label><span data-i18n="remoteTextToken">New text API token (16+ characters)</span><input id="remote-text-token" type="password" minlength="16" autocomplete="new-password" /></label>
+          <label class="checkline"><input id="remote-clear-token" type="checkbox" /><span data-i18n="remoteClearToken">Revoke text API token</span></label>
         </div>
         <p id="remote-security-status" class="hint" data-i18n="remotePasswordHint">Leave the password empty to keep the current password.</p>
       </div>
