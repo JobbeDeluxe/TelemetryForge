@@ -28,3 +28,16 @@ jobs:
           node scripts/test-preview.cjs
       - name: Build release
         run: cargo build --release --locked
+      - name: Create SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash target/release/TelemetryForge.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  TelemetryForge.exe" | Set-Content target/release/TelemetryForge.exe.sha256
+      - name: Upload test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: TelemetryForge-windows-x64-network-auto
+          if-no-files-found: error
+          path: |
+            target/release/TelemetryForge.exe
+            target/release/TelemetryForge.exe.sha256
